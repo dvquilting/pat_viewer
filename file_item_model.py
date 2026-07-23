@@ -1,5 +1,5 @@
 """
-Qt model/delegate pair used by both the Preview and Assign Keywords grids:
+Qt model/delegate pair used by both the Thumbnail Mode and Assign Keywords grids:
 FileItemModel holds the row data (path/name/ext/checked-state) and
 ThumbnailDelegate paints each cell (thumbnail image, filename, optional
 checkbox overlay) directly with QPainter for performance at scale.

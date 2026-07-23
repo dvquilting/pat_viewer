@@ -2,7 +2,7 @@
 Two-layer persistent LRU thumbnail cache (in-memory dict + on-disk shelve,
 one shelve connection per thread), the module-level current thumbnail
 colour, the thumbnail renderer, and ThumbnailRenderCoordinator — a
-QThreadPool-backed parallel renderer used by the Preview and Assign Keywords
+QThreadPool-backed parallel renderer used by the Thumbnail Mode and Assign Keywords
 grids.
 
 Thread-safety contract

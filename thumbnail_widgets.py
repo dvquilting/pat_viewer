@@ -1,5 +1,5 @@
 """
-Thumbnail grid widgets: the plain single-select Preview grid (ThumbnailGrid)
+Thumbnail grid widgets: the plain single-select Thumbnail Mode grid (ThumbnailGrid)
 and the multi-select Assign Keywords grid (KeywordAssignGrid), plus the
 older per-widget ThumbnailCard/KeywordAssignCard classes retained for
 compatibility (the grids now use FileItemModel + ThumbnailDelegate + a
