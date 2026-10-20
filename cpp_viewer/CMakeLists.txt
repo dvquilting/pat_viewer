@@ -1,5 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
-project(QuiltPatternViewer VERSION 1.0.0 LANGUAGES CXX)
+# The single source of the version: the programs and the Windows installer
+# (installer/windows/build-installer.ps1) take it from here.
+project(QuiltPatternViewer VERSION 1.1.0 LANGUAGES CXX)
 
 option(QPV_BUILD_GUI "Build the Qt 6 desktop viewer when Qt is available" ON)
 option(QPV_BUILD_TESTS "Build the dependency-free unit tests" ON)
@@ -15,6 +17,7 @@ add_library(qpv_core
 )
 target_include_directories(qpv_core PUBLIC include)
 target_compile_features(qpv_core PUBLIC cxx_std_20)
+target_compile_definitions(qpv_core PUBLIC QPV_VERSION="${PROJECT_VERSION}")
 if(MSVC)
     target_compile_options(qpv_core PRIVATE /W4 /permissive- /utf-8)
 else()

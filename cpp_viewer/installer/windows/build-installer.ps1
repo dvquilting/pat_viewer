@@ -30,6 +30,14 @@ foreach ($required in @($CMakePath, $windeployqt, $InnoCompilerPath, $definition
     }
 }
 
+# CMakeLists.txt is the single source of the version number.
+$cmakeLists = Get-Content -LiteralPath (Join-Path $projectRoot "CMakeLists.txt") -Raw
+$versionMatch = [regex]::Match($cmakeLists, 'project\s*\(\s*\S+\s+VERSION\s+([0-9]+(\.[0-9]+)*)')
+if (-not $versionMatch.Success) {
+    throw "Could not find the project version in CMakeLists.txt."
+}
+$version = $versionMatch.Groups[1].Value
+
 if (-not $SkipBuild) {
     & $CMakePath --build $BuildDirectory --config Release --target qpv
     if ($LASTEXITCODE -ne 0) {
@@ -68,6 +76,7 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 & $InnoCompilerPath `
+    "/DMyAppVersion=$version" `
     "/DStageDir=$stageDirectory" `
     "/DOutputDir=$outputDirectory" `
     $definition

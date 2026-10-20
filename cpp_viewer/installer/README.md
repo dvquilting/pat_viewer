@@ -14,6 +14,11 @@ by default under `%LOCALAPPDATA%\Programs\Quilt Pattern Viewer`, creates a
 Start Menu shortcut, offers an optional desktop shortcut, and registers a
 standard Windows uninstaller.
 
+The version number comes from `project(... VERSION x.y.z)` in
+`CMakeLists.txt`; change it there before building a new release. Each run
+replaces `installer\output`, so move an installer you want to keep into
+`installer\archive` (ignored by git) first.
+
 Use `-SkipBuild` to repackage an existing release build. The Qt, CMake, and
 Inno Setup paths can be overridden with the script parameters when those
 tools are installed somewhere else.

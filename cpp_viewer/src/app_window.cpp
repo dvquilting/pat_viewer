@@ -1494,11 +1494,12 @@ Ctrl+Shift+V SVG→QLI · Ctrl+Shift+Q QLI→PAT · F1 Help.</p>)");
 void MainWindow::showAbout() {
     QMessageBox::about(this, tr("About Innova PAT / QLI Viewer"),
         tr("<h3>Innova PAT / QLI Viewer</h3>"
+           "<p>Version %1</p>"
            "<p>A viewer for Innova PAT and Statler Stitcher QLI quilting pattern files.</p>"
            "<p>Supports G00/G01 linear moves and G02/G03 circular arc moves. "
            "QLI files are converted to PAT format internally before display.</p>"
            "<p>Pattern files are stored in a persistent library with user-defined "
-           "keywords for easy searching.</p>"));
+           "keywords for easy searching.</p>").arg(QPV_VERSION));
 }
 
 void MainWindow::openInitialPath(const QString& path) {

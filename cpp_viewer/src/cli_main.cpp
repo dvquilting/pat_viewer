@@ -23,7 +23,7 @@ namespace {
 
 void usage() {
     std::cout <<
-        "Quilt Pattern Viewer converter 1.0\n"
+        "Quilt Pattern Viewer converter " QPV_VERSION "\n"
         "Usage:\n"
         "  qpv-cli info <file>\n"
         "  qpv-cli convert <input.pat|qli|svg> <output.pat|qli>\n"

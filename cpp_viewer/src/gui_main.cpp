@@ -6,6 +6,7 @@ int main(int argc, char** argv) {
     QApplication app(argc, argv);
     QApplication::setApplicationName("Quilt Pattern Viewer");
     QApplication::setOrganizationName("dvquilting");
+    QApplication::setApplicationVersion(QPV_VERSION);
     qpv::MainWindow window;
     window.show();
     // arguments() decodes the command line properly on every platform; argv on
