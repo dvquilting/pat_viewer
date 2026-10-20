@@ -71,7 +71,7 @@ class Reader {
 public:
     Pattern read(const std::filesystem::path& path) {
         std::ifstream in(path);
-        if (!in) throw std::runtime_error("Cannot open QLI file: " + path.string());
+        if (!in) throw std::runtime_error("Cannot open QLI file: " + path_text(path));
         result_.filename = path;
         result_.moves.reserve(4096);
         result_.moves.push_back({10, 0, {0.0, 0.0}, std::nullopt});
@@ -148,9 +148,27 @@ private:
             const double sy = radius * std::sin(start);
             const double nx = current_x_ + radius * std::cos(end) - sx;
             const double ny = current_y_ + radius * std::sin(end) - sy;
-            result_.moves.push_back({
-                sequence_++, range < 0 ? 2 : 3, {nx * scale, ny * scale},
-                Point{(current_x_ - sx) * scale, (current_y_ - sy) * scale}});
+            if (needle_ == 0) {
+                // With the needle off nothing is sewn, so this is a travel move;
+                // PAT travel moves are straight.
+                result_.moves.push_back({sequence_++, 0, {nx * scale, ny * scale}, std::nullopt});
+            } else {
+                // A PAT arc whose end meets its start is sewn as a semicircle,
+                // so a full circle must not be written as one arc. Arcs over
+                // 180 degrees are split into equal pieces of at most 180 (a
+                // split 270-degree arc sews the same).
+                const double cx = current_x_ - sx, cy = current_y_ - sy;
+                const int pieces =
+                    std::max(1, static_cast<int>(std::ceil(std::abs(range) / 180.0 - 1e-9)));
+                const double step = range * std::numbers::pi / 180.0 / pieces;
+                for (int k = 1; k <= pieces; ++k) {
+                    const double px = k == pieces ? nx : cx + radius * std::cos(start + step * k);
+                    const double py = k == pieces ? ny : cy + radius * std::sin(start + step * k);
+                    result_.moves.push_back({sequence_++, range < 0 ? 2 : 3,
+                                             {px * scale, py * scale},
+                                             Point{cx * scale, cy * scale}});
+                }
+            }
             current_x_ = nx;
             current_y_ = ny;
         }
@@ -165,7 +183,7 @@ Pattern read_qli(const std::filesystem::path& path) {
 
 void write_qli(const Pattern& pattern, const std::filesystem::path& path) {
     std::ofstream out(path, std::ios::binary);
-    if (!out) throw std::runtime_error("Cannot write QLI file: " + path.string());
+    if (!out) throw std::runtime_error("Cannot write QLI file: " + path_text(path));
     for (auto comment : pattern.comments) {
         // ';' separates QLI commands, so it would turn the rest of the comment
         // into commands when the file is read back.
@@ -212,7 +230,7 @@ void write_qli(const Pattern& pattern, const std::filesystem::path& path) {
         current = move.end;
     }
     out << "EN\r\n";
-    if (!out) throw std::runtime_error("Error writing QLI file: " + path.string());
+    if (!out) throw std::runtime_error("Error writing QLI file: " + path_text(path));
 }
 
 } // namespace qpv

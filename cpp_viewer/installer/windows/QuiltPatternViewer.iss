@@ -1,6 +1,10 @@
 #define MyAppName "Quilt Pattern Viewer"
-#define MyAppVersion "1.0.0"
 #define MyAppPublisher "Quilt Pattern Viewer"
+
+; build-installer.ps1 passes the version from CMakeLists.txt.
+#ifndef MyAppVersion
+  #error MyAppVersion is not defined; build with installer\windows\build-installer.ps1
+#endif
 #define MyAppExeName "qpv.exe"
 
 #ifndef StageDir
@@ -22,8 +26,8 @@ DefaultGroupName={#MyAppName}
 DisableProgramGroupPage=yes
 PrivilegesRequired=lowest
 PrivilegesRequiredOverridesAllowed=dialog
-ArchitecturesAllowed=x64
-ArchitecturesInstallIn64BitMode=x64
+ArchitecturesAllowed=x64compatible
+ArchitecturesInstallIn64BitMode=x64compatible
 OutputDir={#OutputDir}
 OutputBaseFilename=QuiltPatternViewer-{#MyAppVersion}-win64-setup
 Compression=lzma2/ultra64

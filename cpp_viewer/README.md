@@ -23,12 +23,13 @@ It has:
 ## Where the viewer keeps its data
 
 - The pattern library and keywords are in `library.json` in the app data
-  folder (on Windows, `%APPDATA%\OpenAI\Quilt Pattern Viewer`). Earlier
-  versions kept them in QSettings (the registry on Windows); they are moved to
-  `library.json` the first time a newer version starts.
-- The line colour is still a QSettings value.
+  folder (on Windows, `%APPDATA%\dvquilting\Quilt Pattern Viewer`).
+- The line colour is a QSettings value under `dvquilting/QuiltPatternViewer`.
 - Thumbnails are cached as PNG files in the cache folder (on Windows,
-  `%LOCALAPPDATA%\OpenAI\Quilt Pattern Viewer\cache\thumbnails`).
+  `%LOCALAPPDATA%\dvquilting\Quilt Pattern Viewer\cache\thumbnails`).
+- Earlier versions used the organisation name "OpenAI" for all of these, and
+  before that kept the library in QSettings (the registry on Windows). That
+  data is moved to the locations above the first time a newer version starts.
 
 ## Build
 
