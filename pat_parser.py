@@ -12,9 +12,12 @@ import re
 
 from models import Move, PatFile
 
+# Numbers may omit the leading digit (".25", "-.5"); such moves used to be
+# silently dropped.
+_NUM = r'([+-]?(?:\d+\.?\d*|\.\d+))'
 _MOVE_RE = re.compile(
-    r'N(\d+)\s*G(\d+)\s*X([+-]?\d+\.?\d*)\s*Y([+-]?\d+\.?\d*)'
-    r'(?:\s*I([+-]?\d+\.?\d*)\s*J([+-]?\d+\.?\d*))?',
+    rf'N(\d+)\s*G(\d+)\s*X{_NUM}\s*Y{_NUM}'
+    rf'(?:\s*I{_NUM}\s*J{_NUM})?',
     re.IGNORECASE
 )
 _END_RE  = re.compile(r'N(\d+)\s*M02', re.IGNORECASE)

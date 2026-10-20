@@ -119,6 +119,29 @@ class FileDatabase:
         except sqlite3.Error:
             return False
 
+    def add_many(self, paths) -> int:
+        """Add many files in one transaction; returns how many were new."""
+        rows = []
+        for path in paths:
+            path = normalize_path(path)
+            name = os.path.basename(path)
+            ext  = name.rsplit('.', 1)[-1].upper() if '.' in name else ''
+            rows.append((path, name, ext, ''))
+        if not rows:
+            return 0
+        try:
+            with self._lock:
+                with self._con:
+                    before = self._con.total_changes
+                    self._con.executemany(
+                        "INSERT OR IGNORE INTO files(path, name, ext, keywords) "
+                        "VALUES(?,?,?,?)",
+                        rows,
+                    )
+                    return self._con.total_changes - before
+        except sqlite3.Error:
+            return 0
+
     def remove(self, path: str):
         path = normalize_path(path)
         with self._lock:
@@ -177,22 +200,21 @@ class FileDatabase:
             ).fetchall()
         return rows
 
-    def purge_missing(self) -> int:
-        removed = 0
+    def all_paths(self) -> list[str]:
         with self._lock:
-            with self._con:
-                cursor = self._con.execute("SELECT path FROM files")
-                while True:
-                    batch = cursor.fetchmany(500)
-                    if not batch:
-                        break
-                    missing = [(p,) for (p,) in batch if not os.path.exists(p)]
-                    if missing:
-                        self._con.executemany(
-                            "DELETE FROM files WHERE path=?", missing
-                        )
-                        removed += len(missing)
-        return removed
+            return [p for (p,) in self._con.execute("SELECT path FROM files")]
+
+    def purge_missing(self) -> int:
+        """Remove entries whose files are gone. The files are checked without
+        holding the database lock, which can take a while on network drives."""
+        missing = [p for p in self.all_paths() if not os.path.exists(p)]
+        if missing:
+            with self._lock:
+                with self._con:
+                    self._con.executemany(
+                        "DELETE FROM files WHERE path=?", [(p,) for p in missing]
+                    )
+        return len(missing)
 
     def count(self) -> int:
         with self._lock:
@@ -246,16 +268,23 @@ class FileLoaderThread(QThread):
     def run(self):
         try:
             from file_loader import load_file
+            from canvas import build_runs
             pat = load_file(self._path)
+            # Prepare the canvas drawing data here too, so opening a large
+            # pattern does not stall the GUI thread.
+            pat.canvas_runs = build_runs(pat)
             self.finished_.emit(pat, self._path, None)
         except Exception as e:
             self.finished_.emit(None, self._path, e)
 
 
 class FileScanThread(QThread):
-    """Recursively scan a folder and emit each qualifying file found."""
-    found     = Signal(str)   # abs_path
+    """Recursively scan a folder and add every pattern file found."""
+    found     = Signal(str)   # abs_path of each file found
+    progress  = Signal(int)   # files found so far (throttled, for the status bar)
     finished_ = Signal(int)   # total new files added
+
+    BATCH = 500   # files per database transaction
 
     def __init__(self, root: str, db: FileDatabase, parent=None):
         super().__init__(parent)
@@ -267,17 +296,40 @@ class FileScanThread(QThread):
         self._stopped = True
 
     def run(self):
-        added = 0
+        import time
+        added = found = 0
+        batch: list[str] = []
+        last_report = time.monotonic()
         for dirpath, dirs, files in os.walk(self._root):
             if self._stopped:
                 break
             dirs.sort(key=str.lower)
             for fname in sorted(files, key=str.lower):
-                if self._stopped:
-                    break
                 if fname.lower().endswith(('.pat', '.qli', '.svg')):
                     abs_path = os.path.join(dirpath, fname)
-                    if self._db.add(abs_path):
-                        added += 1
+                    batch.append(abs_path)
+                    found += 1
                     self.found.emit(abs_path)
+            # One transaction per batch instead of a commit per file.
+            if len(batch) >= self.BATCH:
+                added += self._db.add_many(batch)
+                batch.clear()
+            if time.monotonic() - last_report > 0.2:
+                last_report = time.monotonic()
+                self.progress.emit(found)
+        if batch and not self._stopped:
+            added += self._db.add_many(batch)
+        self.progress.emit(found)
         self.finished_.emit(added)
+
+
+class PurgeMissingThread(QThread):
+    """Run FileDatabase.purge_missing off the GUI thread."""
+    finished_ = Signal(int)   # entries removed
+
+    def __init__(self, db: FileDatabase, parent=None):
+        super().__init__(parent)
+        self._db = db
+
+    def run(self):
+        self.finished_.emit(self._db.purge_missing())
