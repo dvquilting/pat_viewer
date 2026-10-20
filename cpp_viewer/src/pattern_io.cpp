@@ -90,8 +90,10 @@ double arc_sweep(double start, double end, bool ccw) noexcept {
         return v < 0.0 ? v + 360.0 : v;
     };
     double sweep = ccw ? positive_mod(end - start) : -positive_mod(start - end);
-    // Coincident start and end angles mean a full circle, as in G-code.
-    if (std::abs(sweep) < 1e-12) sweep = ccw ? 360.0 : -360.0;
+    // When start and end coincide the Innova machine sews a semicircle, not
+    // a full circle, so that is what is drawn. The QLI reader splits arcs
+    // over 180 degrees so converted files never depend on this.
+    if (std::abs(sweep) < 1e-12) sweep = ccw ? 180.0 : -180.0;
     return sweep;
 }
 

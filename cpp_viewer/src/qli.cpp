@@ -153,9 +153,21 @@ private:
                 // PAT travel moves are straight.
                 result_.moves.push_back({sequence_++, 0, {nx * scale, ny * scale}, std::nullopt});
             } else {
-                result_.moves.push_back({
-                    sequence_++, range < 0 ? 2 : 3, {nx * scale, ny * scale},
-                    Point{(current_x_ - sx) * scale, (current_y_ - sy) * scale}});
+                // A PAT arc whose end meets its start is sewn as a semicircle,
+                // so a full circle must not be written as one arc. Arcs over
+                // 180 degrees are split into equal pieces of at most 180 (a
+                // split 270-degree arc sews the same).
+                const double cx = current_x_ - sx, cy = current_y_ - sy;
+                const int pieces =
+                    std::max(1, static_cast<int>(std::ceil(std::abs(range) / 180.0 - 1e-9)));
+                const double step = range * std::numbers::pi / 180.0 / pieces;
+                for (int k = 1; k <= pieces; ++k) {
+                    const double px = k == pieces ? nx : cx + radius * std::cos(start + step * k);
+                    const double py = k == pieces ? ny : cy + radius * std::sin(start + step * k);
+                    result_.moves.push_back({sequence_++, range < 0 ? 2 : 3,
+                                             {px * scale, py * scale},
+                                             Point{cx * scale, cy * scale}});
+                }
             }
             current_x_ = nx;
             current_y_ = ny;

@@ -83,11 +83,17 @@ int main() {
                           [](const qpv::Move& m) { return m.gcode == 2 || m.gcode == 3; }),
               "SVG circular arc");
 
-        // Coincident arc endpoints are a full circle and must survive conversion.
-        close(qpv::arc_sweep(0, 0, true), 360, 1e-12, "CCW full-circle sweep");
-        close(qpv::arc_sweep(0, 0, false), -360, 1e-12, "CW full-circle sweep");
+        // An arc whose end meets its start is sewn as a semicircle by the
+        // machine, so a full circle from a QLI file is split into halves and
+        // survives conversion.
+        close(qpv::arc_sweep(0, 0, true), 180, 1e-12, "CCW coincident sweep is a semicircle");
+        close(qpv::arc_sweep(0, 0, false), -180, 1e-12, "CW coincident sweep is a semicircle");
+        auto is_arc = [](const qpv::Move& m) { return m.gcode == 2 || m.gcode == 3; };
         const auto circle_qli = dir / "circle.qli";
         write(circle_qli, "VP 1000,0\nCR 1000,0,360\nVP 5000,0\nEN\n");
+        const auto circle_moves = qpv::read_qli(circle_qli).moves;
+        check(std::count_if(circle_moves.begin(), circle_moves.end(), is_arc) == 2,
+              "QLI full circle split into two arcs");
         const auto circle_pat = dir / "circle.pat";
         qpv::write_pat(qpv::read_qli(circle_qli), circle_pat);
         const auto circle = qpv::read_pat(circle_pat);
@@ -95,10 +101,9 @@ int main() {
         const auto circle_back = dir / "circle_back.qli";
         qpv::write_qli(circle, circle_back);
         const auto circle_reread = qpv::read_qli(circle_back);
-        const auto circle_arc = std::find_if(
-            circle_reread.moves.begin(), circle_reread.moves.end(),
-            [](const qpv::Move& m) { return m.gcode == 2 || m.gcode == 3; });
-        check(circle_arc != circle_reread.moves.end(), "QLI full circle arc");
+        const auto circle_arc = std::find_if(circle_reread.moves.rbegin(),
+                                             circle_reread.moves.rend(), is_arc);
+        check(circle_arc != circle_reread.moves.rend(), "QLI full circle arc");
         close(circle_arc->end.x, 1.0, 1e-6, "QLI full circle end x");
         close(circle_arc->end.y, 0.0, 1e-6, "QLI full circle end y");
 
