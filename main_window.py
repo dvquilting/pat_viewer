@@ -12,15 +12,19 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QFileDialog, QSizePolicy,
     QStatusBar, QFrame, QCheckBox, QSlider,
-    QSplitter, QListWidget, QListWidgetItem, QLineEdit,
+    QSplitter, QListView, QLineEdit,
     QTextEdit, QGroupBox, QStackedWidget, QMessageBox,
 )
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt, QTimer, QItemSelectionModel
 from PySide6.QtGui import QColor, QAction, QKeySequence, QActionGroup
 
 from models import PatFile
-from database import FileDatabase, FileLoaderThread, FileScanThread, normalize_path
+from database import (
+    FileDatabase, FileLoaderThread, FileScanThread, PurgeMissingThread, normalize_path,
+)
 from canvas import PatCanvas
+from file_item_model import FileListModel
+from background import BatchConvertThread, JobDialog, convert_one_file
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -31,7 +35,13 @@ class MainWindow(QMainWindow):
         self._scan_thread: Optional[FileScanThread] = None
         self._dup_thread = None
         self._loader_thread: Optional[FileLoaderThread] = None
+        # Loaders still running after a newer request; kept referenced until done.
+        self._stale_loaders: set = set()
         self._pending_load_path: Optional[str] = None
+        self._purge_thread: Optional[PurgeMissingThread] = None
+        # The one background job (folder listing or conversion) allowed at a time.
+        self._job_thread = None
+        self._job_dialog: Optional[JobDialog] = None
         self._dup_auto = False
         self._all_rows:    list[tuple[str,str,str,str]] = []
         self._current_path: Optional[str] = None
@@ -43,7 +53,6 @@ class MainWindow(QMainWindow):
         self._search_timer.setInterval(250)
         self._search_timer.setSingleShot(True)
         self._search_timer.timeout.connect(self._run_search)
-        self._qli_overwrite_all = False
         self._build_ui()
         self._list_status.setText("Loading…")
         QTimer.singleShot(0, self._reload_list)
@@ -312,10 +321,14 @@ class MainWindow(QMainWindow):
         list_page_layout = QVBoxLayout(list_page)
         list_page_layout.setContentsMargins(0, 0, 0, 0)
         list_page_layout.setSpacing(0)
-        self._file_list = QListWidget()
+        # A view on a list model: filtering resets the model instead of
+        # rebuilding one QListWidgetItem per file on every keystroke.
+        self._file_list = QListView()
         self._file_list.setMinimumWidth(220)
-        self._file_list.setToolTip("Click a file to view it")
-        self._file_list.currentItemChanged.connect(self._on_list_selection)
+        self._file_list.setUniformItemSizes(True)
+        self._list_model = FileListModel(self)
+        self._file_list.setModel(self._list_model)
+        self._file_list.selectionModel().currentChanged.connect(self._on_list_selection)
         list_page_layout.addWidget(self._file_list)
         self._stack.addWidget(list_page)
 
@@ -425,9 +438,16 @@ class MainWindow(QMainWindow):
         if self._kw_assign_grid is not None:
             self._kw_assign_grid.stop_render(wait=True)
 
-        if self._loader_thread and self._loader_thread.isRunning():
-            self._loader_thread.quit()
-            self._loader_thread.wait()
+        for loader in [self._loader_thread, *self._stale_loaders]:
+            if loader is not None and loader.isRunning():
+                loader.wait()
+        if self._job_thread is not None:
+            if hasattr(self._job_thread, "stop"):
+                self._job_thread.stop()
+            self._job_thread.requestInterruption()
+            self._job_thread.wait()
+        if self._purge_thread is not None and self._purge_thread.isRunning():
+            self._purge_thread.wait()
 
         if self._scan_thread and self._scan_thread.isRunning():
             self._scan_thread.stop()
@@ -516,25 +536,19 @@ class MainWindow(QMainWindow):
             rows = self._all_rows
 
         # ---- Update flat list ----
-        self._file_list.blockSignals(True)
-        self._file_list.clear()
-        select_item = None
-        for path, name, ext, _keywords in rows:
-            item = QListWidgetItem(name)
-            item.setData(Qt.UserRole, path)
-            item.setToolTip(path)
-            if ext == 'QLI':
-                item.setForeground(QColor(0, 100, 180))
-            elif ext == 'SVG':
-                item.setForeground(QColor(160, 60, 0))
-            else:
-                item.setForeground(QColor(20, 130, 60))
-            self._file_list.addItem(item)
-            if path == preserve_selection:
-                select_item = item
-        self._file_list.blockSignals(False)
-        if select_item:
-            self._file_list.setCurrentItem(select_item)
+        self._list_model.load_data(rows)
+        current = preserve_selection or self._current_path or ""
+        row = self._list_model.row_for_path(current) if current else -1
+        if row >= 0:
+            # Restore the current row (so arrow keys continue from it)
+            # without reopening the file.
+            selection = self._file_list.selectionModel()
+            selection.blockSignals(True)
+            selection.setCurrentIndex(self._list_model.index(row, 0),
+                                      QItemSelectionModel.ClearAndSelect)
+            selection.blockSignals(False)
+            if preserve_selection:
+                self._file_list.scrollTo(self._list_model.index(row, 0))
 
         # ---- Update thumbnail grids only when that view is active ----
         if self._stack.currentIndex() == 1 and self._thumb_grid is not None:
@@ -562,9 +576,9 @@ class MainWindow(QMainWindow):
         self._apply_filter(self._search_box.text())
 
     def _on_list_selection(self, current, _previous):
-        if current is None:
+        if current is None or not current.isValid():
             return
-        path = current.data(Qt.UserRole)
+        path = current.data(FileListModel.PathRole)
         if path:
             self._load_and_display(path)
 
@@ -808,58 +822,32 @@ as you type (short debounce). Clearing the box shows the full library again.</p>
         if not qli_paths:
             return
 
-        converted = 0
-        last_out  = None
-        self._qli_overwrite_all = False
-
-        for qli_path in qli_paths:
-            default_out = os.path.splitext(qli_path)[0] + ".pat"
-
-            # For multiple files, only ask for a save location once per file
-            if len(qli_paths) == 1:
-                out_path, _ = QFileDialog.getSaveFileName(
-                    self, "Save PAT File As", default_out,
-                    "PAT Files (*.pat);;All Files (*)"
-                )
-                if not out_path:
-                    continue
-            else:
-                out_path = default_out
-                if os.path.exists(out_path) and not self._qli_overwrite_all:
-                    reply = QMessageBox.question(
-                        self, "Overwrite PAT File?",
-                        f"'{os.path.basename(out_path)}' already exists.\n\n"
-                        "Overwrite it?",
-                        QMessageBox.Yes | QMessageBox.No | QMessageBox.YesToAll,
-                        QMessageBox.No,
-                    )
-                    if reply == QMessageBox.No:
-                        continue
-                    if reply == QMessageBox.YesToAll:
-                        self._qli_overwrite_all = True
-
+        if len(qli_paths) == 1:
+            default_out = os.path.splitext(qli_paths[0])[0] + ".pat"
+            out_path, _ = QFileDialog.getSaveFileName(
+                self, "Save PAT File As", default_out,
+                "PAT Files (*.pat);;All Files (*)"
+            )
+            if not out_path:
+                return
             try:
-                from qli_converter import QliConverter
-                from pat_writer import _write_pat_file
-                pat = QliConverter().convert(qli_path)
-                _write_pat_file(pat, out_path)
-                self._db.add(out_path)
-                converted += 1
-                last_out   = out_path
+                convert_one_file(qli_paths[0], out_path, 'qli_to_pat')
             except Exception as e:
                 QMessageBox.critical(
                     self, "Conversion Error",
-                    f"Failed to convert '{os.path.basename(qli_path)}':\n\n{e}"
+                    f"Failed to convert '{os.path.basename(qli_paths[0])}':\n\n{e}"
                 )
-
-        if converted:
+                return
+            self._db.add(out_path)
             self._reload_list()
-            if last_out:
-                self._load_and_display(last_out)
-            self._status.setText(
-                f"Converted {converted} QLI file{'s' if converted != 1 else ''} to PAT "
-                f"and added to database."
-            )
+            self._load_and_display(out_path)
+            self._status.setText("Converted 1 QLI file to PAT and added to database.")
+            return
+
+        # Several files: each PAT is written beside its source, in the background.
+        jobs = [(p, os.path.splitext(p)[0] + ".pat") for p in qli_paths]
+        existing = sum(1 for _src, out in jobs if os.path.exists(out))
+        self._start_batch_convert(jobs, existing, 'qli_to_pat')
 
     # ----------------------------------------------------------------- SVG conversion
 
@@ -1034,128 +1022,105 @@ as you type (short debounce). Clearing the box shows the full library again.</p>
         self, folder: str, recursive: bool, source_exts: tuple
     ) -> list[str]:
         """Return sorted paths of matching source files (optionally recursive)."""
-        paths: list[str] = []
-        if recursive:
-            for dirpath, dirs, files in os.walk(folder):
-                dirs.sort(key=str.lower)
-                for fname in sorted(files, key=str.lower):
-                    if fname.lower().endswith(source_exts):
-                        paths.append(os.path.join(dirpath, fname))
-        else:
-            try:
-                names = os.listdir(folder)
-            except OSError as e:
-                QMessageBox.critical(
-                    self, "Folder Error",
-                    f"Could not read folder:\n\n{e}",
-                )
-                return []
-            for fname in sorted(names, key=str.lower):
-                full = os.path.join(folder, fname)
-                if os.path.isfile(full) and fname.lower().endswith(source_exts):
-                    paths.append(full)
-        return paths
+        from background import collect_convertible_files
+        try:
+            return collect_convertible_files(folder, recursive, source_exts)
+        except OSError as e:
+            QMessageBox.critical(self, "Folder Error", f"Could not read folder:\n\n{e}")
+            return []
 
     def _convert_one_file(self, src_path: str, out_path: str, mode: str) -> None:
         """Run a single conversion for the given folder-batch mode. Raises on failure."""
-        if mode == 'qli_to_pat':
-            from qli_converter import QliConverter
-            from pat_writer import _write_pat_file
-            pat = QliConverter().convert(src_path)
-            _write_pat_file(pat, out_path)
-        elif mode == 'svg_to_pat':
-            from svg_converter import svg_to_pat_file
-            svg_to_pat_file(src_path, out_path)
-        elif mode == 'svg_to_qli':
-            from svg_converter import svg_to_qli_file
-            svg_to_qli_file(src_path, out_path)
-        else:
-            raise ValueError(f"Unknown conversion mode: {mode}")
+        convert_one_file(src_path, out_path, mode)
 
     def _convert_folder(self, folder: str, recursive: bool = False,
                         mode: str = 'qli_to_pat'):
-        """Convert matching source files under folder using the chosen mode."""
+        """
+        Convert matching source files under folder using the chosen mode.
+        Listing the folder, checking for existing outputs and converting all
+        run in the background.
+        """
         if mode not in self._FOLDER_CONVERT_MODES:
             raise ValueError(f"Unknown conversion mode: {mode}")
-
-        label, source_exts, out_ext, src_name = self._FOLDER_CONVERT_MODES[mode]
-        paths = self._collect_convertible_files(
-            folder, recursive=recursive, source_exts=source_exts)
-        if not paths:
-            scope = "folder and subfolders" if recursive else "folder"
-            QMessageBox.information(
-                self,
-                "No Files Found",
-                f"No {src_name} files found in this {scope}.",
-            )
+        if self._job_busy():
             return
 
-        converted = 0
-        skipped = 0
-        errors: list[str] = []
-        last_out = None
-        overwrite_all = False
-        total = len(paths)
-        out_label = out_ext.lstrip('.').upper()
+        label, source_exts, out_ext, src_name = self._FOLDER_CONVERT_MODES[mode]
+        from background import CollectConvertibleThread
+        thread = CollectConvertibleThread(folder, recursive, source_exts, out_ext, self)
+        dialog = JobDialog(f"Convert Folder — {label}", f"Looking for {src_name} files…",
+                           thread.requestInterruption, self)
 
-        for i, src_path in enumerate(paths, start=1):
-            out_path = os.path.splitext(src_path)[0] + out_ext
-            name = os.path.basename(src_path)
-            self._status.setText(
-                f"Converting {i}/{total} ({label}): {name} …"
-            )
-            QApplication.processEvents()
+        def collected(jobs, existing, error):
+            self._finish_job(thread, dialog)
+            if thread.isInterruptionRequested():
+                self._status.setText("Folder conversion cancelled.")
+            elif error:
+                QMessageBox.critical(self, "Folder Error", f"Could not read folder:\n\n{error}")
+            elif not jobs:
+                scope = "folder and subfolders" if recursive else "folder"
+                QMessageBox.information(self, "No Files Found",
+                                        f"No {src_name} files found in this {scope}.")
+            else:
+                self._start_batch_convert(jobs, existing, mode)
 
-            if os.path.exists(out_path) and not overwrite_all:
-                reply = QMessageBox.question(
-                    self,
-                    f"Overwrite {out_label} File?",
-                    f"'{os.path.basename(out_path)}' already exists.\n\n"
-                    "Overwrite it?",
-                    QMessageBox.Yes | QMessageBox.No
-                    | QMessageBox.YesToAll | QMessageBox.Cancel,
-                    QMessageBox.No,
-                )
-                if reply == QMessageBox.Cancel:
-                    self._status.setText(
-                        f"Folder conversion cancelled after {converted} file"
-                        f"{'s' if converted != 1 else ''}."
-                    )
-                    if converted:
-                        self._reload_list()
-                    return
-                if reply == QMessageBox.No:
-                    skipped += 1
-                    continue
-                if reply == QMessageBox.YesToAll:
-                    overwrite_all = True
+        thread.finished_.connect(collected)
+        self._start_job(thread, dialog)
 
-            try:
-                self._convert_one_file(src_path, out_path, mode)
-                self._db.add(out_path)
-                converted += 1
-                last_out = out_path
-            except ImportError as e:
-                QMessageBox.critical(self, "Missing Dependency", str(e))
-                if converted:
-                    self._reload_list()
+    def _start_batch_convert(self, jobs: list, existing: int, mode: str):
+        """Convert (source, output) pairs in the background, asking once about overwrites."""
+        if self._job_busy():
+            return
+        label, _exts, out_ext, _src = self._FOLDER_CONVERT_MODES[mode]
+        overwrite = False
+        if existing:
+            # One question for the whole batch instead of one per existing file.
+            box = QMessageBox(
+                QMessageBox.Question, f"Overwrite {out_ext.lstrip('.').upper()} Files?",
+                f"{existing} of the {len(jobs)} output file"
+                f"{'s' if len(jobs) != 1 else ''} already exist.",
+                QMessageBox.NoButton, self)
+            overwrite_btn = box.addButton("Overwrite", QMessageBox.AcceptRole)
+            skip_btn = box.addButton("Skip Existing", QMessageBox.AcceptRole)
+            box.addButton(QMessageBox.Cancel)
+            box.setDefaultButton(skip_btn)
+            box.exec()
+            if box.clickedButton() not in (overwrite_btn, skip_btn):
+                self._status.setText("Conversion cancelled.")
                 return
-            except Exception as e:
-                errors.append(f"{name}: {e}")
+            overwrite = box.clickedButton() is overwrite_btn
 
+        thread = BatchConvertThread(jobs, mode, overwrite, self)
+        dialog = JobDialog(label, f"Converting {len(jobs)} files…", thread.stop, self)
+        thread.progress.connect(
+            lambda done, total, name: dialog.set_progress(
+                done, total, f"{label}: {done + 1} of {total}\n{name}"))
+
+        def finished(converted, skipped, errors, cancelled):
+            self._finish_job(thread, dialog)
+            self._on_batch_convert_done(label, len(jobs), converted, skipped, errors, cancelled)
+
+        thread.finished_.connect(finished)
+        self._start_job(thread, dialog)
+
+    def _on_batch_convert_done(self, label: str, total: int, converted: list,
+                               skipped: int, errors: list, cancelled: bool):
         if converted:
+            # Files converted before a cancel exist on disk, so they are kept.
+            self._db.add_many(converted)
             self._reload_list()
-            if last_out:
-                self._load_and_display(last_out)
+            self._load_and_display(converted[-1])
 
         parts = [
-            f"{label}: converted {converted} of {total} "
+            f"{label}: converted {len(converted)} of {total} "
             f"file{'s' if total != 1 else ''}"
         ]
         if skipped:
             parts.append(f"{skipped} skipped")
         if errors:
             parts.append(f"{len(errors)} failed")
+        if cancelled:
+            parts.append("cancelled")
         self._status.setText("; ".join(parts) + ".")
 
         if errors:
@@ -1171,6 +1136,28 @@ as you type (short debounce). Clearing the box shows the full library again.</p>
                 f"The following file{'s' if len(errors) != 1 else ''} "
                 f"could not be converted:\n\n{body}",
             )
+
+    # ----------------------------------------------------------------- background jobs
+
+    def _job_busy(self) -> bool:
+        if self._job_thread is not None:
+            self._status.setText("Please wait for the current task to finish.")
+            return True
+        return False
+
+    def _start_job(self, thread, dialog: JobDialog):
+        """Run one background job; its window appears only if it takes a while."""
+        self._job_thread = thread
+        self._job_dialog = dialog
+        QTimer.singleShot(400, dialog, lambda: dialog.show() if self._job_dialog is dialog else None)
+        thread.start()
+
+    def _finish_job(self, thread, dialog: JobDialog):
+        thread.wait()
+        if self._job_thread is thread:
+            self._job_thread = None
+            self._job_dialog = None
+        dialog.finish()
 
     # ----------------------------------------------------------------- add file
 
@@ -1215,14 +1202,11 @@ as you type (short debounce). Clearing the box shows the full library again.</p>
 
         self._status.setText(f"Scanning {folder} …")
         self._scan_thread = FileScanThread(folder, self._db, self)
-        self._scan_thread.found.connect(self._on_scan_file_found)
+        self._scan_thread.progress.connect(
+            lambda found: self._status.setText(
+                f"Scanning {folder} … {found} pattern file{'s' if found != 1 else ''} found"))
         self._scan_thread.finished_.connect(self._on_scan_done)
         self._scan_thread.start()
-
-    def _on_scan_file_found(self, _abs_path: str):
-        # Throttle: only refresh the list every 50 signals to avoid UI thrashing
-        # We track count via the sender's internal state; just refresh periodically
-        pass   # final refresh happens in _on_scan_done
 
     def _on_scan_done(self, added: int):
         self._reload_list()
@@ -1248,9 +1232,9 @@ as you type (short debounce). Clearing the box shows the full library again.</p>
         mode = self._stack.currentIndex()
 
         if mode == 0:
-            item = self._file_list.currentItem()
-            if item is not None:
-                path = item.data(Qt.UserRole)
+            index = self._file_list.currentIndex()
+            if index.isValid():
+                path = index.data(FileListModel.PathRole)
                 if path:
                     return [path]
 
@@ -1311,7 +1295,19 @@ as you type (short debounce). Clearing the box shows the full library again.</p>
             )
 
     def _purge_missing(self):
-        removed = self._db.purge_missing()
+        """Check every file in the background (slow on network drives)."""
+        if self._purge_thread is not None and self._purge_thread.isRunning():
+            self._status.setText("Purge Missing is already running…")
+            return
+        self._status.setText("Checking for missing files…")
+        self._purge_thread = PurgeMissingThread(self._db, self)
+        self._purge_thread.finished_.connect(self._on_purge_done)
+        self._purge_thread.start()
+
+    def _on_purge_done(self, removed: int):
+        # The open file may have been one of the missing ones.
+        if self._current_path and not os.path.exists(self._current_path):
+            self._clear_displayed_file()
         self._reload_list()
         self._status.setText(
             f"Purged {removed} missing file{'s' if removed != 1 else ''} from database."
@@ -1342,6 +1338,8 @@ as you type (short debounce). Clearing the box shows the full library again.</p>
             return
 
         # Stop background work that depends on the current DB contents.
+        if self._purge_thread is not None and self._purge_thread.isRunning():
+            self._purge_thread.wait()
         if self._scan_thread and self._scan_thread.isRunning():
             self._scan_thread.stop()
             self._scan_thread.wait()
@@ -1515,7 +1513,12 @@ as you type (short debounce). Clearing the box shows the full library again.</p>
             except RuntimeError:
                 pass
             if self._loader_thread.isRunning():
-                self._loader_thread.wait()
+                # Don't wait for it: quick keyboard navigation through large
+                # files used to block here. It finishes on its own and its
+                # result is ignored; keep it referenced until then.
+                stale = self._loader_thread
+                self._stale_loaders.add(stale)
+                stale.finished.connect(lambda: self._stale_loaders.discard(stale))
 
         name = os.path.basename(path)
         self._status.setText(f"Loading '{name}'...")
@@ -1538,7 +1541,8 @@ as you type (short debounce). Clearing the box shows the full library again.</p>
         if pat is None:
             return # Safety catch
 
-        self._canvas.load(pat)
+        # The loader thread prepares the drawing data off the GUI thread.
+        self._canvas.load(pat, getattr(pat, "canvas_runs", None))
         self._current_path = path   # track for keyword save
 
         name     = os.path.basename(path)
@@ -1606,14 +1610,31 @@ as you type (short debounce). Clearing the box shows the full library again.</p>
         normalised = ', '.join(cleaned)
 
         # Write back the normalised form so the field looks tidy too
-        self._info_keywords.blockSignals(True)
-        self._info_keywords.setText(normalised)
-        self._info_keywords.blockSignals(False)
+        if self._info_keywords.text() != normalised:
+            self._info_keywords.blockSignals(True)
+            self._info_keywords.setText(normalised)
+            self._info_keywords.blockSignals(False)
 
-        self._db.set_keywords(self._current_path, normalised)
-        self._reload_list(preserve_selection=self._current_path)
+        # editingFinished also fires whenever focus merely leaves the field.
+        path = self._current_path
+        if normalised == self._db.get_keywords(path):
+            return
+        self._db.set_keywords(path, normalised)
+
+        # Update the rows in place rather than reloading and rebuilding every
+        # view; only a keyword search can change which files match.
+        self._all_rows = [(p, n, e, normalised if p == path else k)
+                          for p, n, e, k in self._all_rows]
+        query = self._search_box.text().strip()
+        if query and self._search_scope() in ('both', 'keywords'):
+            self._apply_filter(self._search_box.text(), preserve_selection=path)
+        else:
+            for grid in (self._thumb_grid, self._kw_assign_grid):
+                if grid is not None:
+                    grid._model.update_keywords(path, normalised)
+            self._list_model.update_keywords(path, normalised)
         self._status.setText(
-            f"Keywords saved for '{os.path.basename(self._current_path)}'."
+            f"Keywords saved for '{os.path.basename(path)}'."
         )
 
     # ----------------------------------------------------------------- toggles

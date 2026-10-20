@@ -15,4 +15,10 @@ THUMB_ARC_DEGREES = 8.0        # coarser arc sampling than the canvas (2°)
 THUMB_PAT_CACHE_SIZE = 200     # parsed PatFile LRU entries
 THUMB_DISK_FLUSH_EVERY = 25    # deferred shelve writes batched per thread
 
+# Thumbnails kept in memory. The disk cache holds everything; these only need
+# to cover a few screens around the viewport. (At 2x render scale one
+# thumbnail is ~230 KB, so the previous 4000 + 4000 could reach ~1.8 GB.)
+THUMB_MEMORY_ITEMS = 200       # QImage LRU, shared with workers
+THUMB_PIXMAP_ITEMS = 400       # QPixmap LRU, GUI thread only
+
 

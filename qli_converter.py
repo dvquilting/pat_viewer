@@ -161,12 +161,30 @@ class QliConverter:
                     self.next_x = self.current_x + (ep_x - sp_x)
                     self.next_y = self.current_y + (ep_y - sp_y)
 
-                    # I/J = center offset, scaled to PAT units
-                    rcx = self.SCALE * (self.current_x - sp_x)
-                    rcy = self.SCALE * (self.current_y - sp_y)
-
-                    self._emit_arc(circle_cmd, self.next_x, self.next_y,
-                                   rcx, rcy)
+                    if self.needle == 0:
+                        # Needle off: nothing is sewn, so this is a travel
+                        # move; PAT travel moves are straight.
+                        self._emit_linear()
+                    else:
+                        # Circle centre, in QLI units.
+                        cx = self.current_x - sp_x
+                        cy = self.current_y - sp_y
+                        # A PAT arc whose end meets its start is sewn as a
+                        # semicircle, so a full circle must not be written as
+                        # one arc. Arcs over 180° are split into equal pieces
+                        # of at most 180° (a split 270° arc sews the same).
+                        pieces = max(1, math.ceil(abs(angle_range) / 180.0 - 1e-9))
+                        step = math.radians(angle_range) / pieces
+                        for k in range(1, pieces + 1):
+                            if k == pieces:
+                                px, py = self.next_x, self.next_y
+                            else:
+                                a = sa + step * k
+                                px = cx + radius * math.cos(a)
+                                py = cy + radius * math.sin(a)
+                            # I/J = absolute center, scaled to PAT units
+                            self._emit_arc(circle_cmd, px, py,
+                                           self.SCALE * cx, self.SCALE * cy)
                     self.current_x = self.next_x
                     self.current_y = self.next_y
 
@@ -295,7 +313,12 @@ def write_qli_file(pat: PatFile, out_path: str) -> str:
     lines: list[str] = []
 
     for comment in pat.comments:
-        text = (comment or "").replace("\r", " ").replace("\n", " ").strip()
+        # ';' separates QLI commands, so it would turn the rest of the comment
+        # into commands when the file is read back.
+        text = (comment or "")
+        for ch in ("\r", "\n", ";"):
+            text = text.replace(ch, " ")
+        text = text.strip()
         if text:
             lines.append(f"REM {text}")
 

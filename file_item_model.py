@@ -22,13 +22,29 @@ class FileItemModel(QAbstractListModel):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._rows = []
+        self._row_of: dict[str, int] = {}   # path → row, instead of linear scans
         self._checked_paths = set()
 
     def rowCount(self, parent=QModelIndex()):
         return len(self._rows)
 
+    def row_for_path(self, path: str) -> int:
+        """Row of *path*, or -1."""
+        return self._row_of.get(path, -1)
+
+    def update_keywords(self, path: str, keywords: str) -> bool:
+        """Change one row's keywords in place, without resetting the model."""
+        row = self._row_of.get(path, -1)
+        if row < 0:
+            return False
+        p, name, ext, _old = self._rows[row]
+        self._rows[row] = (p, name, ext, keywords)
+        index = self.index(row, 0)
+        self.dataChanged.emit(index, index)
+        return True
+
     def data(self, index, role=Qt.DisplayRole):
-        if not index.isValid():
+        if not index.isValid() or not 0 <= index.row() < len(self._rows):
             return None
         path, name, ext, _kw = self._rows[index.row()]
         
@@ -51,7 +67,8 @@ class FileItemModel(QAbstractListModel):
 
     def load_data(self, rows, keep_checked=False):
         self.beginResetModel()
-        self._rows = rows
+        self._rows = list(rows)
+        self._row_of = {r[0]: i for i, r in enumerate(self._rows)}
         if not keep_checked:
             self._checked_paths.clear()
         else:
@@ -62,7 +79,7 @@ class FileItemModel(QAbstractListModel):
 
     def get_checked_paths(self):
         return self._checked_paths
-        
+
     def set_all_checked(self, checked: bool):
         self.beginResetModel()
         if checked:
@@ -70,6 +87,28 @@ class FileItemModel(QAbstractListModel):
         else:
             self._checked_paths.clear()
         self.endResetModel()
+
+
+class FileListModel(FileItemModel):
+    """
+    The plain List View's model: names coloured by file type, full path as
+    the tooltip. A model reset is cheap, unlike rebuilding thousands of
+    QListWidgetItems on every search keystroke.
+    """
+    _COLORS = {'QLI': QColor(0, 100, 180), 'SVG': QColor(160, 60, 0)}
+    _DEFAULT_COLOR = QColor(20, 130, 60)
+
+    def data(self, index, role=Qt.DisplayRole):
+        if not index.isValid() or not 0 <= index.row() < len(self._rows):
+            return None
+        path, name, ext, _kw = self._rows[index.row()]
+        if role == Qt.DisplayRole:
+            return name
+        if role == Qt.ToolTipRole:
+            return path
+        if role == Qt.ForegroundRole:
+            return self._COLORS.get(ext, self._DEFAULT_COLOR)
+        return super().data(index, role)
 
 
 class ThumbnailDelegate(QStyledItemDelegate):

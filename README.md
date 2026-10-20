@@ -10,10 +10,10 @@ PySide6 desktop app for viewing `.pat`, `.qli`, and `.svg` embroidery files.
 - Dependencies:
 
 ```bash
-pip install PySide6 pytest pytest-qt pytest-cov svgpathtools
+pip install PySide6 pytest pytest-qt pytest-cov
 ```
 
-`svgpathtools` is only needed for SVG conversion tests. All other tests run without it.
+SVG import is built in; `svgpathtools` is no longer needed.
 
 ### Run all tests
 
@@ -62,7 +62,7 @@ Some tests are tagged with markers defined in `pytest.ini`:
 | Marker | Description |
 |--------|-------------|
 | `qt`   | Requires a Qt event loop (most widget tests) |
-| `svg`  | Requires `svgpathtools` |
+| `svg`  | SVG conversion tests |
 | `slow` | Integration or large-file tests |
 
 Examples:

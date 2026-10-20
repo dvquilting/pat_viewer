@@ -21,15 +21,15 @@ from PySide6.QtCore import (
     QObject, QRunnable, QThread, QThreadPool, Qt, Signal,
     QByteArray, QBuffer, QIODevice,
 )
-from PySide6.QtGui import QPainter, QPen, QColor, QPainterPath, QTransform, QPixmap, QImage
+from PySide6.QtGui import QPainter, QPen, QColor, QTransform, QPixmap, QImage
 from PySide6.QtWidgets import QApplication
 
 from constants import (
     THUMB_SIZE, THUMB_CACHE_PATH, THUMB_MAX_WORKERS,
     THUMB_ARC_DEGREES, THUMB_PAT_CACHE_SIZE, THUMB_DISK_FLUSH_EVERY,
+    THUMB_MEMORY_ITEMS, THUMB_PIXMAP_ITEMS,
 )
 from file_loader import load_file
-from geometry import arc_to_path
 
 
 def _default_render_scale() -> int:
@@ -83,11 +83,13 @@ class ThumbnailCache:
 
     FLUSH_EVERY = THUMB_DISK_FLUSH_EVERY
 
-    def __init__(self, db_path: str = THUMB_CACHE_PATH, max_size: int = 4000):
+    def __init__(self, db_path: str = THUMB_CACHE_PATH,
+                 max_size: int = THUMB_MEMORY_ITEMS, max_pixmaps: int = None):
         from collections import OrderedDict
 
         self._db_path = db_path
         self._max     = max_size
+        self._max_gui = max_pixmaps if max_pixmaps is not None else max(max_size, THUMB_PIXMAP_ITEMS)
         self._lock    = threading.Lock()
         self._mem: "OrderedDict[str, QImage]" = OrderedDict()
         # Main-thread-only paint cache — never lock-shared with workers.
@@ -223,7 +225,7 @@ class ThumbnailCache:
         pm = image_to_pixmap(image)
         self._gui[key] = pm
         self._gui.move_to_end(key)
-        while len(self._gui) > self._max:
+        while len(self._gui) > self._max_gui:
             self._gui.popitem(last=False)
         return pm
 
@@ -415,22 +417,10 @@ def set_thumbnail_color(color: QColor):
     _thumb_stitch_color = QColor(color)
 
 
-def _build_stitch_path(pat, arc_degrees: float = THUMB_ARC_DEGREES) -> QPainterPath:
-    stitch = QPainterPath()
-    cur_x = cur_y = 0.0
-    for mv in pat.moves:
-        tx, ty = mv.x, mv.y
-        if mv.gcode == 1:
-            stitch.moveTo(cur_x, cur_y)
-            stitch.lineTo(tx, ty)
-        elif (mv.gcode in (2, 3)
-              and mv.i is not None and mv.j is not None):
-            stitch.addPath(arc_to_path(
-                cur_x, cur_y, tx, ty, mv.i, mv.j, mv.gcode,
-                degrees_per_segment=arc_degrees,
-            ))
-        cur_x, cur_y = tx, ty
-    return stitch
+def _stitch_runs(pat, arc_degrees: float = THUMB_ARC_DEGREES) -> list:
+    """The pattern's stitch polylines (travel left out), as drawn by the canvas."""
+    from canvas import build_runs
+    return [run for run in build_runs(pat, arc_degrees) if not run.travel]
 
 
 def _render_one_thumbnail(path: str, size: int, color: QColor = None,
@@ -448,9 +438,11 @@ def _render_one_thumbnail(path: str, size: int, color: QColor = None,
     except Exception:
         return _blank_image(size)
 
-    stitch = _build_stitch_path(pat)
-    bounds = stitch.boundingRect()
-    if bounds.isEmpty() or bounds.width() == 0 or bounds.height() == 0:
+    runs = _stitch_runs(pat)
+    bounds = None
+    for run in runs:
+        bounds = run.bounds if bounds is None else bounds.united(run.bounds)
+    if bounds is None or bounds.width() <= 2e-6 or bounds.height() <= 2e-6:
         return _blank_image(size)
 
     render_size = size * render_scale
@@ -474,7 +466,8 @@ def _render_one_thumbnail(path: str, size: int, color: QColor = None,
     pen = QPen(color, 0.5 * render_scale)
     pen.setCosmetic(True)
     painter.setPen(pen)
-    painter.drawPath(stitch)
+    for run in runs:
+        painter.drawPath(run.path)
     painter.end()
 
     img.setDevicePixelRatio(render_scale)

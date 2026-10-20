@@ -10,24 +10,53 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QCheckBox, QLineEdit,
     QPushButton, QFrame, QListView,
 )
-from PySide6.QtCore import Qt, Signal, QTimer
+from PySide6.QtCore import Qt, Signal, QTimer, QPoint
 
 from constants import THUMB_SIZE
 from thumbnail_cache import _blank_thumbnail, ThumbnailRenderCoordinator
 from file_item_model import FileItemModel, ThumbnailDelegate
 
 
+def _visible_rows(view: QListView, model: FileItemModel) -> range:
+    """
+    Rows whose cells are in the viewport. Finds the first and last visible
+    rows with indexAt() along the top and bottom edges instead of asking every
+    row for its rectangle, which took O(rows) per render batch.
+    """
+    if model.rowCount() == 0:
+        return range(0)
+    rect = view.viewport().rect()
+
+    def rows_at(y: int) -> list:
+        rows = []
+        for x in range(4, max(rect.width(), 5), 40):   # cells are wider than 40 px
+            index = view.indexAt(QPoint(x, y))
+            if index.isValid():
+                rows.append(index.row())
+        return rows
+
+    top = rows_at(4) or rows_at(rect.height() // 2)
+    if not top:
+        return range(0)
+    bottom = rows_at(rect.height() - 4) or rows_at(rect.height() // 2) or top
+    first, last = min(top), max(bottom)
+    return range(first, max(first, last) + 1)
+
+
 def _visible_paths(view: QListView, model: FileItemModel) -> set:
     """Return paths whose thumbnail cells intersect the list viewport."""
     paths = set()
-    viewport_rect = view.viewport().rect()
-    for row in range(model.rowCount()):
-        index = model.index(row, 0)
-        if viewport_rect.intersects(view.visualRect(index)):
-            path = model.data(index, FileItemModel.PathRole)
-            if path:
-                paths.add(path)
+    for row in _visible_rows(view, model):
+        path = model.data(model.index(row, 0), FileItemModel.PathRole)
+        if path:
+            paths.add(path)
     return paths
+
+
+def _repaint_path(view: QListView, model: FileItemModel, path: str):
+    row = model.row_for_path(path)
+    if row >= 0:
+        view.viewport().update(view.visualRect(model.index(row, 0)))
 
 
 class ThumbnailCard(QWidget):
@@ -137,11 +166,7 @@ class ThumbnailGrid(QWidget):
             self._render_coordinator = coord
 
     def _update_row_for_path(self, path: str):
-        for row in range(self._model.rowCount()):
-            idx = self._model.index(row, 0)
-            if self._model.data(idx, FileItemModel.PathRole) == path:
-                self._view.viewport().update(self._view.visualRect(idx))
-                return
+        _repaint_path(self._view, self._model, path)
 
     def populate(self, rows: list):
         self.stop_render()
@@ -150,11 +175,9 @@ class ThumbnailGrid(QWidget):
         self._model.load_data(rows)
 
     def select(self, path: str):
-        for row in range(self._model.rowCount()):
-            idx = self._model.index(row, 0)
-            if self._model.data(idx, FileItemModel.PathRole) == path:
-                self._view.setCurrentIndex(idx)
-                break
+        row = self._model.row_for_path(path)
+        if row >= 0:
+            self._view.setCurrentIndex(self._model.index(row, 0))
 
     def selected_path(self) -> str | None:
         """Return the path of the currently selected thumbnail, or None."""
@@ -198,11 +221,10 @@ class ThumbnailGrid(QWidget):
                 self._render_coordinator.stop()
 
     def refresh_colors(self):
+        """Thumbnails are cached per colour; repainting requests the visible ones."""
         if self._render_coordinator is not None:
             self._render_coordinator.refresh_render_scale()
-        paths = [r[0] for r in self._model._rows]
-        if paths:
-            self._start_render(paths)
+        self._view.viewport().update()
 
 class KeywordAssignCard(QWidget):
     """
@@ -394,11 +416,7 @@ class KeywordAssignGrid(QWidget):
             self._render_coordinator = coord
 
     def _update_row_for_path(self, path: str):
-        for row in range(self._model.rowCount()):
-            idx = self._model.index(row, 0)
-            if self._model.data(idx, FileItemModel.PathRole) == path:
-                self._view.viewport().update(self._view.visualRect(idx))
-                return
+        _repaint_path(self._view, self._model, path)
 
     def populate(self, rows: list):
         self.stop_render()
@@ -442,11 +460,10 @@ class KeywordAssignGrid(QWidget):
                 self._render_coordinator.stop()
 
     def refresh_colors(self):
+        """Thumbnails are cached per colour; repainting requests the visible ones."""
         if self._render_coordinator is not None:
             self._render_coordinator.refresh_render_scale()
-        paths = [r[0] for r in self._model._rows]
-        if paths:
-            self._start_render(paths)
+        self._view.viewport().update()
 
     def checked_paths(self) -> list:
         """Return paths currently checked for keyword assignment."""
