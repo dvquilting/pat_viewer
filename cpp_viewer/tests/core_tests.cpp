@@ -7,6 +7,7 @@
 #include <fstream>
 #include <iostream>
 #include <stdexcept>
+#include <string>
 
 namespace fs = std::filesystem;
 
@@ -160,6 +161,105 @@ int main() {
         const auto commented_pat_back = qpv::read_pat(commented_pat);
         check(commented_pat_back.moves.size() == 2, "PAT comment injection");
         check(commented_pat_back.comments.size() == 2, "PAT comments kept");
+
+        // File names outside the ANSI code page work, and errors name them in UTF-8.
+        const auto unicode_pat = dir / fs::path(u8"Café üł.pat");
+        write(unicode_pat, "N10G00X0Y0\r\nN11G01X1Y1\r\n");
+        check(qpv::load_pattern(unicode_pat).moves.size() == 2, "Non-ASCII PAT path");
+        const auto unicode_qli = dir / fs::path(u8"Blüte 中.qli");
+        qpv::convert_file(unicode_pat, unicode_qli);
+        check(qpv::read_qli(unicode_qli).moves.size() == 3, "Non-ASCII QLI path");
+        try {
+            (void)qpv::read_pat(dir / fs::path(u8"Fehlt ä.pat"));
+            check(false, "Missing file did not throw");
+        } catch (const std::runtime_error& e) {
+            check(std::string(e.what()).find("Fehlt \xC3\xA4.pat") != std::string::npos,
+                  "UTF-8 file name in error message");
+        }
+
+        // Arcs without a centre are written as the straight stitches they are
+        // drawn as, and other codes are kept rather than dropped.
+        qpv::Pattern odd;
+        odd.moves = {{10, 0, {0.0, 0.0}, std::nullopt}, {11, 2, {1.0, 0.0}, std::nullopt},
+                     {12, 92, {2.0, 0.0}, std::nullopt}};
+        const auto odd_pat = dir / "odd.pat";
+        qpv::write_pat(odd, odd_pat);
+        const auto odd_back = qpv::read_pat(odd_pat);
+        check(odd_back.moves.size() == 3, "PAT writer keeps every move");
+        check(odd_back.moves[1].gcode == 1, "Centre-less arc written as G01");
+        check(odd_back.moves[2].gcode == 92, "Unknown G-code kept");
+
+        // An arc made with the needle off is travel.
+        const auto needle_qli = dir / "needle.qli";
+        write(needle_qli, "NO NEEDLE OFF\nCR 1000,0,90\nEN\n");
+        const auto needle = qpv::read_qli(needle_qli).moves.back();
+        check(needle.gcode == 0 && !needle.center, "QLI arc with needle off is travel");
+
+        // SVG: transforms, styles, hidden content, basic shapes and frames.
+        // width="100in" with a 100-unit viewBox makes one user unit one PAT unit.
+        auto svg_doc = [&dir](const char* name, const std::string& body) {
+            const auto file = dir / name;
+            write(file, "<svg width=\"100in\" viewBox=\"0 0 100 100\">" + body + "</svg>");
+            return qpv::read_svg(file);
+        };
+        auto has_arc = [](const qpv::Pattern& p) {
+            return std::any_of(p.moves.begin(), p.moves.end(),
+                               [](const qpv::Move& m) { return m.gcode == 2 || m.gcode == 3; });
+        };
+        auto stitches = [](const qpv::Pattern& p) {
+            return std::count_if(p.moves.begin(), p.moves.end(),
+                                 [](const qpv::Move& m) { return m.gcode != 0; });
+        };
+        const auto moved = svg_doc("transform.svg",
+            "<g transform=\"translate(10,0) scale(2)\"><path stroke=\"black\" d=\"M0 0 L5 0\"/></g>"
+            "<path stroke=\"black\" d=\"M0 0 L1 0\"/>");
+        close(qpv::pattern_bounds(moved).width(), 20.0, 1e-6, "SVG group transform");
+
+        const auto flipped = svg_doc("flipped.svg",
+            "<g transform=\"scale(1,-1)\"><path stroke=\"black\" d=\"M0 0 L10 10\"/></g>");
+        check(flipped.moves.back().end.y > flipped.moves[flipped.moves.size() - 2].end.y,
+              "SVG flipped group points up");
+
+        const auto styled = svg_doc("styled.svg",
+            "<g style=\"stroke:red\"><path d=\"M0 0 L50 0\"/></g>"
+            "<path style=\"fill:#000;stroke:none\" d=\"M0 0 L50 50\"/>"
+            "<defs><path stroke=\"black\" d=\"M0 0 L80 0\"/></defs>"
+            "<path stroke=\"black\" d=\"M0 0 L5 0\"/>");
+        close(qpv::pattern_bounds(styled).width(), 5.0, 1e-6, "SVG styles, inheritance and defs");
+
+        const auto shapes = svg_doc("shapes.svg",
+            "<line x1=\"0\" y1=\"0\" x2=\"10\" y2=\"0\" stroke=\"black\"/>"
+            "<polyline points=\"0,0 0,10 5,10\" stroke=\"black\" fill=\"none\"/>"
+            "<circle cx=\"20\" cy=\"5\" r=\"5\" stroke=\"black\" fill=\"none\"/>");
+        check(has_arc(shapes), "SVG circle keeps arcs");
+        close(qpv::pattern_bounds(shapes).width(), 25.0, 1e-3, "SVG basic shapes width");
+        close(qpv::pattern_bounds(shapes).height(), 10.0, 1e-3, "SVG basic shapes height");
+
+        const auto rotated = svg_doc("rotated.svg",
+            "<circle r=\"5\" transform=\"rotate(30)\" stroke=\"black\" fill=\"none\"/>");
+        check(has_arc(rotated), "SVG rotated circle keeps arcs");
+        const auto stretched = svg_doc("stretched.svg",
+            "<circle r=\"5\" transform=\"scale(2,1)\" stroke=\"black\" fill=\"none\"/>");
+        check(!has_arc(stretched), "SVG stretched circle is flattened");
+        close(qpv::pattern_bounds(stretched).width(), 20.0, 0.01, "SVG stretched circle width");
+        close(qpv::pattern_bounds(stretched).height(), 10.0, 0.01, "SVG stretched circle height");
+
+        const auto rounded = svg_doc("rounded.svg",
+            "<rect width=\"20\" height=\"10\" rx=\"2\" stroke=\"black\" fill=\"none\"/>");
+        check(has_arc(rounded), "SVG rounded rect corners are arcs");
+        close(qpv::pattern_bounds(rounded).width(), 20.0, 1e-3, "SVG rounded rect width");
+
+        const auto framed = svg_doc("framed.svg",
+            "<rect width=\"100\" height=\"100\" stroke=\"black\" fill=\"none\"/>"
+            "<path stroke=\"black\" d=\"M10 10 L20 20\"/>");
+        close(qpv::pattern_bounds(framed).width(), 10.0, 1e-6, "SVG registration frame removed");
+        const auto inner = svg_doc("inner.svg",
+            "<path stroke=\"black\" d=\"M0 0 L100 100\"/>"
+            "<rect x=\"10\" y=\"10\" width=\"20\" height=\"20\" stroke=\"black\" fill=\"none\"/>");
+        check(stitches(inner) == 5, "SVG square inside a design kept");
+        const auto square = svg_doc("square.svg",
+            "<rect width=\"10\" height=\"10\" stroke=\"black\" fill=\"none\"/>");
+        check(stitches(square) == 4, "SVG design that is only a square kept");
 
         // Number parsing must not depend on the C locale's decimal separator.
         bool comma_locale = false;

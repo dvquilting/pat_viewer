@@ -80,8 +80,22 @@ int main(int argc, char** argv) {
         check(state.isValid(), "Could not create temporary settings directory");
         QSettings::setDefaultFormat(QSettings::IniFormat);
         QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, state.path());
+        // Earlier versions used the organisation name "OpenAI"; their data must
+        // move to the current locations.
         QSettings settings("OpenAI", "QuiltPatternViewer");
         settings.clear();
+        QSettings current("dvquilting", "QuiltPatternViewer");
+        current.clear();
+        auto legacyLocation = [](QStandardPaths::StandardLocation location) {
+            const QString organization = QCoreApplication::organizationName();
+            QCoreApplication::setOrganizationName("OpenAI");
+            const QString path = QStandardPaths::writableLocation(location);
+            QCoreApplication::setOrganizationName(organization);
+            return path;
+        };
+        QDir legacyData(legacyLocation(QStandardPaths::AppDataLocation));
+        check(!legacyData.exists() || legacyData.removeRecursively(),
+              "Could not clear the legacy test data folder");
 
         const QString cacheRoot =
             QStandardPaths::writableLocation(QStandardPaths::CacheLocation);
@@ -104,15 +118,37 @@ int main(int argc, char** argv) {
         std::cerr << "Migrating a QSettings library\n";
         settings.setValue("library", QStringList{"C:/x/a.pat", "C:/x/b.pat", "C:/X/A.pat"});
         settings.setValue("keywords", QVariantMap{{"C:/x/a.pat", "feather"}});
+        settings.setValue("lineColor", "#123456");
         settings.sync();
         { qpv::MainWindow migrating; }
         settings.sync();
+        current.sync();
         const QJsonObject migrated = readLibrary();
         check(migrated.value("library").toArray().size() == 2, "Migrated library entries");
         check(migrated.value("keywords").toObject().value("C:/x/a.pat").toString() == "feather",
               "Migrated keywords");
         check(!settings.contains("library") && !settings.contains("keywords"),
               "Library left in QSettings after migration");
+        check(current.value("lineColor").toString() == "#123456" && !settings.contains("lineColor"),
+              "Line colour not moved to the new settings");
+        check(QFile::remove(libraryFile), "Could not reset library.json");
+
+        // So does library.json from the earlier organisation's data folder.
+        std::cerr << "Migrating a library.json from the old data folder\n";
+        check(legacyData.mkpath("."), "Could not create the legacy data folder");
+        const QString legacyFile = legacyData.filePath("library.json");
+        {
+            QFile file(legacyFile);
+            check(file.open(QIODevice::WriteOnly), "Could not write the legacy library.json");
+            file.write(R"({"version":1,"library":["C:/y/one.pat","C:/y/two.qli","C:/y/three.svg"],)"
+                       R"("keywords":{"C:/y/two.qli":"border"}})");
+        }
+        { qpv::MainWindow migrating; }
+        const QJsonObject moved = readLibrary();
+        check(moved.value("library").toArray().size() == 3, "Migrated library.json entries");
+        check(moved.value("keywords").toObject().value("C:/y/two.qli").toString() == "border",
+              "Migrated library.json keywords");
+        check(!QFile::exists(legacyFile), "Legacy library.json left behind");
         check(QFile::remove(libraryFile), "Could not reset library.json");
 
         QTemporaryDir patterns;
@@ -175,10 +211,30 @@ int main(int argc, char** argv) {
                   "Generated thumbnail PNG could not be decoded");
         std::cout << "Generated " << generated
                   << " thumbnails in " << elapsed.elapsed() << " ms\n";
+
+        // A file name outside the ANSI code page renders and opens (on a worker).
+        std::cerr << "Opening a pattern with a non-ASCII name\n";
+        QTemporaryDir unicodeDir;
+        const QString unicodeName = QString::fromUtf8("Muster \xC3\xA4 \xC5\x82 \xE4\xB8\xAD.pat");
+        const QString unicodePath = unicodeDir.filePath(unicodeName);
+        {
+            QFile file(unicodePath);
+            check(file.open(QIODevice::WriteOnly), "Could not create the non-ASCII PAT file");
+            file.write(pattern);
+        }
+        check(!qpv::MainWindow::renderThumbnail(unicodePath, Qt::black).isNull(),
+              "Thumbnail of a non-ASCII file name");
+        window.openInitialPath(unicodePath);
+        QElapsedTimer opening;
+        opening.start();
+        while (!window.windowTitle().contains(unicodeName) && opening.elapsed() < 5000)
+            app.processEvents(QEventLoop::AllEvents, 20);
+        check(window.windowTitle().contains(unicodeName), "Non-ASCII pattern did not open");
+
         window.close();
         owned.reset();  // closing the window saves the library
-        check(readLibrary().value("library").toArray().size() == 110,
-              "library.json does not hold the 110-pattern library");
+        check(readLibrary().value("library").toArray().size() == 111,
+              "library.json does not hold the 110-pattern library and the opened file");
         return 0;
     } catch (const std::exception& e) {
         std::cerr << "Thumbnail test failure: " << e.what() << '\n';

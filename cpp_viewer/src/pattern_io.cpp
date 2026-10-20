@@ -67,8 +67,13 @@ bool parse_number(std::string_view line, char tag, std::size_t& cursor, double& 
 
 } // namespace
 
+std::string path_text(const std::filesystem::path& path) {
+    const auto text = path.u8string();
+    return {reinterpret_cast<const char*>(text.data()), text.size()};
+}
+
 std::string lower_extension(const std::filesystem::path& path) {
-    auto ext = path.extension().string();
+    auto ext = path_text(path.extension());
     std::transform(ext.begin(), ext.end(), ext.begin(),
                    [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
     return ext;
@@ -131,7 +136,7 @@ Bounds pattern_bounds(const Pattern& pattern) {
 
 Pattern read_pat(const std::filesystem::path& path) {
     std::ifstream input(path);
-    if (!input) throw std::runtime_error("Cannot open PAT file: " + path.string());
+    if (!input) throw std::runtime_error("Cannot open PAT file: " + path_text(path));
 
     Pattern pattern;
     pattern.filename = path;
@@ -172,19 +177,18 @@ Pattern read_pat(const std::filesystem::path& path) {
 
 void write_pat(const Pattern& pattern, const std::filesystem::path& path) {
     std::ofstream out(path, std::ios::binary);
-    if (!out) throw std::runtime_error("Cannot write PAT file: " + path.string());
+    if (!out) throw std::runtime_error("Cannot write PAT file: " + path_text(path));
     out << std::fixed << std::setprecision(4);
     for (const auto& move : pattern.moves) {
-        if (move.gcode == 0 || move.gcode == 1) {
-            out << 'N' << std::setw(2) << std::setfill('0') << move.sequence
-                << 'G' << std::setw(2) << move.gcode
-                << 'X' << move.end.x << 'Y' << move.end.y << "\r\n";
-        } else if ((move.gcode == 2 || move.gcode == 3) && move.center) {
-            out << 'N' << std::setw(2) << std::setfill('0') << move.sequence
-                << 'G' << std::setw(2) << move.gcode
-                << 'X' << move.end.x << 'Y' << move.end.y
-                << 'I' << move.center->x << 'J' << move.center->y << "\r\n";
-        }
+        const bool arc = move.gcode == 2 || move.gcode == 3;
+        // An arc without a centre is drawn as a straight stitch, so it is
+        // written as one; other codes are kept as they are.
+        const int gcode = arc && !move.center ? 1 : move.gcode;
+        out << 'N' << std::setw(2) << std::setfill('0') << move.sequence
+            << 'G' << std::setw(2) << gcode
+            << 'X' << move.end.x << 'Y' << move.end.y;
+        if (arc && move.center) out << 'I' << move.center->x << 'J' << move.center->y;
+        out << "\r\n";
     }
     if (pattern.end_sequence) {
         out << 'N' << std::setw(2) << std::setfill('0') << *pattern.end_sequence
@@ -200,7 +204,7 @@ void write_pat(const Pattern& pattern, const std::filesystem::path& path) {
         }
         out << "( " << comment << " )\r\n";
     }
-    if (!out) throw std::runtime_error("Error writing PAT file: " + path.string());
+    if (!out) throw std::runtime_error("Error writing PAT file: " + path_text(path));
 }
 
 Pattern load_pattern(const std::filesystem::path& path, double tolerance) {
@@ -208,7 +212,7 @@ Pattern load_pattern(const std::filesystem::path& path, double tolerance) {
     if (ext == ".pat") return read_pat(path);
     if (ext == ".qli") return read_qli(path);
     if (ext == ".svg") return read_svg(path, tolerance);
-    throw std::runtime_error("Unsupported input format: " + path.string());
+    throw std::runtime_error("Unsupported input format: " + path_text(path));
 }
 
 void convert_file(const std::filesystem::path& input,

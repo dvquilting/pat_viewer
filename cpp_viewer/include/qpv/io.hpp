@@ -22,5 +22,8 @@ void convert_file(const std::filesystem::path& input,
 
 [[nodiscard]] bool is_supported_file(const std::filesystem::path& path);
 [[nodiscard]] std::string lower_extension(const std::filesystem::path& path);
+// The path as UTF-8 text for messages. path::string() uses the ANSI code page
+// on Windows and can throw for names it cannot represent.
+[[nodiscard]] std::string path_text(const std::filesystem::path& path);
 
 } // namespace qpv

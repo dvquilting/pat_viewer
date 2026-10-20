@@ -35,7 +35,8 @@
 #include <QPainterPath>
 #include <QPlainTextEdit>
 #include <QPointer>
-#include <QProgressDialog>
+#include <QCloseEvent>
+#include <QProgressBar>
 #include <QPushButton>
 #include <QRunnable>
 #include <QSaveFile>
@@ -55,6 +56,7 @@
 
 #include <algorithm>
 #include <functional>
+#include <optional>
 #include <unordered_map>
 
 namespace qpv {
@@ -62,6 +64,29 @@ namespace {
 
 constexpr int thumbnail_size = 120;
 constexpr int background_thumbnail_delay_ms = 25;
+constexpr char settings_organization[] = "dvquilting";
+constexpr char settings_application[] = "QuiltPatternViewer";
+// The organisation name used by earlier versions, whose data is moved once.
+constexpr char legacy_organization[] = "OpenAI";
+
+// Where a standard location was under the earlier organisation name.
+QString legacyLocation(QStandardPaths::StandardLocation location) {
+    const QString current = QCoreApplication::organizationName();
+    QCoreApplication::setOrganizationName(legacy_organization);
+    const QString path = QStandardPaths::writableLocation(location);
+    QCoreApplication::setOrganizationName(current);
+    return path;
+}
+
+// QString::toStdString() is UTF-8, but a narrow std::filesystem::path is read
+// in the ANSI code page on Windows (MSVC), which mangles other names.
+std::filesystem::path toPath(const QString& path) {
+#ifdef Q_OS_WIN
+    return std::filesystem::path(path.toStdWString());
+#else
+    return std::filesystem::path(QFile::encodeName(path).toStdString());
+#endif
+}
 
 QString thumbnailCacheDirectory() {
     QString root = QStandardPaths::writableLocation(QStandardPaths::CacheLocation);
@@ -185,32 +210,79 @@ QString fileDigest(const QString& path) {
     return QString::fromLatin1(hash.result().toHex());
 }
 
+// Progress window for background jobs. Unlike QProgressDialog, whose setValue()
+// runs a nested event loop when modal, updating it never processes events, so a
+// job's finish handler cannot run (and delete the dialog) in the middle of an
+// update.
+class JobDialog final : public QDialog {
+public:
+    JobDialog(const QString& title, const QString& label, std::function<void()> onCancel,
+              QWidget* parent)
+        : QDialog(parent), on_cancel_(std::move(onCancel)) {
+        setWindowTitle(title);
+        setWindowModality(Qt::WindowModal);
+        auto* layout = new QVBoxLayout(this);
+        label_ = new QLabel(label);
+        label_->setMinimumWidth(360);
+        bar_ = new QProgressBar;
+        bar_->setRange(0, 0);
+        cancel_ = new QPushButton(tr("Cancel"));
+        layout->addWidget(label_);
+        layout->addWidget(bar_);
+        layout->addWidget(cancel_, 0, Qt::AlignRight);
+        connect(cancel_, &QPushButton::clicked, this, [this] { requestCancel(); });
+    }
+    void setProgress(int done, int total, const QString& label) {
+        if (cancelling_) return;
+        bar_->setRange(0, total);
+        bar_->setValue(done);
+        label_->setText(label);
+    }
+protected:
+    // Escape and the close button cancel the job; the dialog closes when it ends.
+    void reject() override { requestCancel(); }
+    void closeEvent(QCloseEvent* event) override {
+        requestCancel();
+        event->ignore();
+    }
+private:
+    void requestCancel() {
+        if (cancelling_) return;
+        cancelling_ = true;
+        cancel_->setEnabled(false);
+        label_->setText(tr("Cancelling…"));
+        on_cancel_();
+    }
+    std::function<void()> on_cancel_;
+    QLabel* label_{};
+    QProgressBar* bar_{};
+    QPushButton* cancel_{};
+    bool cancelling_{};
+};
+
 } // namespace
 
 // Handed to the work function of MainWindow::runInBackground on its worker thread.
 class BackgroundJob {
 public:
     BackgroundJob(std::shared_ptr<std::atomic<bool>> cancel, QPointer<MainWindow> window,
-                  QPointer<QProgressDialog> dialog)
+                  QPointer<JobDialog> dialog)
         : cancel_(std::move(cancel)), window_(window), dialog_(dialog) {
         since_report_.start();
     }
     [[nodiscard]] bool cancelled() const { return cancel_->load(); }
-    // Updates the progress dialog at most every 100 ms; total 0 shows a busy bar.
+    // Updates the progress window at most every 100 ms; total 0 shows a busy bar.
     void progress(int done, int total, const QString& label) {
         if (since_report_.elapsed() < 100 || !window_) return;
         since_report_.restart();
         QMetaObject::invokeMethod(window_, [dialog = dialog_, done, total, label] {
-            if (!dialog || dialog->wasCanceled()) return;
-            dialog->setMaximum(total);
-            dialog->setValue(done);
-            dialog->setLabelText(label);
+            if (dialog) dialog->setProgress(done, total, label);
         }, Qt::QueuedConnection);
     }
 private:
     std::shared_ptr<std::atomic<bool>> cancel_;
     QPointer<MainWindow> window_;
-    QPointer<QProgressDialog> dialog_;
+    QPointer<JobDialog> dialog_;
     QElapsedTimer since_report_;
 };
 
@@ -237,6 +309,15 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     save_timer_->setInterval(1000);
     connect(save_timer_, &QTimer::timeout, this, &MainWindow::flushLibrary);
     thumbnail_cache_dir_ = thumbnailCacheDirectory();
+    // Reuse thumbnails cached under the earlier organisation name. If the move
+    // fails they are simply rendered again.
+    const QString legacyCacheRoot = legacyLocation(QStandardPaths::CacheLocation);
+    const QString legacyCache = legacyCacheRoot + "/thumbnails";
+    if (!legacyCacheRoot.isEmpty() && legacyCache != thumbnail_cache_dir_ &&
+        QFileInfo::exists(legacyCache) && !QFileInfo::exists(thumbnail_cache_dir_)) {
+        QDir().mkpath(QFileInfo(thumbnail_cache_dir_).absolutePath());
+        QDir().rename(legacyCache, thumbnail_cache_dir_);
+    }
     QDir().mkpath(thumbnail_cache_dir_);
     QPixmap blank(thumbnail_size, thumbnail_size);
     blank.fill(QColor(245, 245, 245));
@@ -490,42 +571,63 @@ QString MainWindow::libraryFilePath() {
 // The library and keywords live in a JSON file rather than QSettings, which on
 // Windows is the registry: rewriting thousands of paths there on every keyword
 // edit was slow, and Microsoft advises against large registry values.
+//
+// Earlier versions stored everything under the organisation name "OpenAI":
+// first the library in QSettings, later library.json in that app data folder.
+// Whatever is found there is moved once, and removed after the new file has
+// been written.
 void MainWindow::loadLibrary() {
-    QSettings settings("OpenAI", "QuiltPatternViewer");
-    line_color_ = QColor(settings.value("lineColor", "#000000").toString());
+    QSettings settings(settings_organization, settings_application);
+    QSettings legacy(legacy_organization, settings_application);
+    const bool legacyColor = !settings.contains("lineColor") && legacy.contains("lineColor");
+    line_color_ = QColor((legacyColor ? legacy : settings).value("lineColor", "#000000").toString());
     canvas_->setLineColor(line_color_);
 
-    bool migrated = false;
-    QFile file(libraryFilePath());
-    if (file.open(QIODevice::ReadOnly)) {
+    enum class Source { File, LegacyFile, LegacySettings };
+    std::optional<Source> source;
+    const QString legacyDataDir = legacyLocation(QStandardPaths::AppDataLocation);
+    const QString legacyFile = legacyDataDir.isEmpty() ? QString() : legacyDataDir + "/library.json";
+    auto readFile = [this](const QString& path) {
+        QFile file(path);
+        if (!file.open(QIODevice::ReadOnly)) return false;
         QJsonParseError error{};
         const auto document = QJsonDocument::fromJson(file.readAll(), &error);
-        if (document.isObject()) {
-            const auto root = document.object();
-            for (const auto& value : root.value("library").toArray())
-                library_ << value.toString();
-            keywords_ = root.value("keywords").toObject().toVariantMap();
-        } else {
+        if (!document.isObject()) {
             // Keep the unreadable file for inspection; the next save replaces it.
-            const QString kept = libraryFilePath() + ".unreadable";
+            const QString kept = path + ".unreadable";
             QFile::remove(kept);
-            QFile::copy(libraryFilePath(), kept);
+            QFile::copy(path, kept);
             statusBar()->showMessage(
                 tr("The pattern library could not be read (%1). A copy was kept as %2.")
                     .arg(error.errorString(), QDir::toNativeSeparators(kept)));
+            return false;
         }
-    } else if (settings.contains("library") || settings.contains("keywords")) {
-        // Earlier versions kept the library in QSettings.
-        library_ = settings.value("library").toStringList();
-        keywords_ = settings.value("keywords").toMap();
-        migrated = true;
+        const auto root = document.object();
+        for (const auto& value : root.value("library").toArray()) library_ << value.toString();
+        keywords_ = root.value("keywords").toObject().toVariantMap();
+        return true;
+    };
+    if (QFile::exists(libraryFilePath())) {
+        if (readFile(libraryFilePath())) source = Source::File;
+    } else if (!legacyFile.isEmpty() && QFile::exists(legacyFile)) {
+        if (readFile(legacyFile)) source = Source::LegacyFile;
+    } else if (legacy.contains("library") || legacy.contains("keywords")) {
+        library_ = legacy.value("library").toStringList();
+        keywords_ = legacy.value("keywords").toMap();
+        source = Source::LegacySettings;
     }
     rebuildLibraryKeys();
-    if (migrated) {
+
+    const bool migrating = (source && *source != Source::File) || legacyColor;
+    if (migrating) {
         library_dirty_ = true;
         if (flushLibrary()) {
-            settings.remove("library");
-            settings.remove("keywords");
+            if (source == Source::LegacyFile) QFile::remove(legacyFile);
+            if (source == Source::LegacySettings) {
+                legacy.remove("library");
+                legacy.remove("keywords");
+            }
+            if (legacyColor) legacy.remove("lineColor");
         }
     }
 }
@@ -538,7 +640,7 @@ void MainWindow::saveLibrary() {
 bool MainWindow::flushLibrary() {
     save_timer_->stop();
     if (!library_dirty_) return true;
-    QSettings settings("OpenAI", "QuiltPatternViewer");
+    QSettings settings(settings_organization, settings_application);
     settings.setValue("lineColor", line_color_.name());
     QJsonObject root;
     root["version"] = 1;
@@ -566,17 +668,10 @@ void MainWindow::runInBackground(const QString& title, const QString& label,
     job_running_ = true;
     auto cancel = std::make_shared<std::atomic<bool>>(false);
     job_cancel_ = cancel;
-    auto* progress = new QProgressDialog(label, tr("Cancel"), 0, 0, this);
-    progress->setWindowTitle(title);
-    progress->setWindowModality(Qt::WindowModal);
-    progress->setMinimumDuration(400);
-    progress->setAutoReset(false);
-    progress->setAutoClose(false);
-    const QPointer<QProgressDialog> dialog(progress);
-    connect(progress, &QProgressDialog::canceled, this, [cancel, dialog] {
-        cancel->store(true);
-        if (dialog) dialog->setLabelText(tr("Cancelling…"));
-    });
+    const QPointer<JobDialog> dialog(
+        new JobDialog(title, label, [cancel] { cancel->store(true); }, this));
+    // Quick jobs finish before the window would flash up.
+    QTimer::singleShot(400, dialog, [dialog] { if (dialog) dialog->show(); });
     const QPointer<MainWindow> self(this);
     // `work` runs on a worker thread and must not touch the window; `finish`
     // runs on the GUI thread once it returns.
@@ -588,7 +683,10 @@ void MainWindow::runInBackground(const QString& title, const QString& label,
             QMetaObject::invokeMethod(self, [self, dialog, finish, cancel] {
                 if (!self) return;
                 self->job_running_ = false;
-                if (dialog) dialog->deleteLater();
+                if (dialog) {
+                    dialog->hide();
+                    dialog->deleteLater();
+                }
                 finish(cancel->load());
             }, Qt::QueuedConnection);
         });
@@ -886,7 +984,7 @@ void MainWindow::applyThumbnail(const QString& path, const QImage& image, QListW
 
 QImage MainWindow::renderThumbnail(const QString& path, const QColor& color) {
     try {
-        const Pattern pattern = load_pattern(path.toStdString());
+        const Pattern pattern = load_pattern(toPath(path));
         const Bounds b = pattern_bounds(pattern);
         QImage image(thumbnail_size, thumbnail_size, QImage::Format_ARGB32_Premultiplied);
         image.fill(Qt::white);
@@ -925,7 +1023,7 @@ QImage MainWindow::renderThumbnail(const QString& path, const QColor& color) {
 
 void MainWindow::addPath(const QString& path) {
     QFileInfo info(path);
-    if (!info.isFile() || !is_supported_file(info.absoluteFilePath().toStdString())) return;
+    if (!info.isFile() || !is_supported_file(toPath(info.absoluteFilePath()))) return;
     addCanonicalPaths({info.canonicalFilePath()});
 }
 
@@ -971,29 +1069,71 @@ void MainWindow::scanFolder(const QString& folder) {
 }
 
 void MainWindow::openFile(const QString& path) {
-    if (path == current_) return;
-    try {
-        Pattern pattern = load_pattern(path.toStdString());
-        const auto bounds = pattern_bounds(pattern);
-        std::size_t stitch = 0, travel = 0;
-        for (const auto& move : pattern.moves) move.gcode == 0 ? ++travel : ++stitch;
-        file_name_->setText(QFileInfo(path).fileName());
-        file_path_->setText(path);
-        dimensions_->setText(QString("%1 × %2 PAT units").arg(bounds.width(), 0, 'f', 3)
-                                                         .arg(bounds.height(), 0, 'f', 3));
-        statistics_->setText(tr("%1 blocks · %2 stitch · %3 travel")
-                             .arg(pattern.moves.size()).arg(stitch).arg(travel));
-        QStringList lines;
-        for (const auto& c : pattern.comments) lines << QString::fromStdString(c);
-        comments_->setPlainText(lines.join('\n'));
-        keyword_edit_->setText(keywords_.value(path).toString());
-        canvas_->setPattern(std::move(pattern));
-        current_ = path;
-        setWindowTitle(tr("Innova PAT / QLI Viewer — %1").arg(QFileInfo(path).fileName()));
-        statusBar()->showMessage(tr("Loaded %1").arg(QFileInfo(path).fileName()));
-    } catch (const std::exception& e) {
-        QMessageBox::critical(this, tr("Could not load pattern"), QString::fromUtf8(e.what()));
-    }
+    if (path == current_ || path == loading_path_) return;
+    loading_path_ = path;
+    const quint64 request = ++open_request_;
+    struct Loaded {
+        Pattern pattern;
+        Bounds bounds;
+        std::size_t stitch{};
+        std::size_t travel{};
+        QString error;
+    };
+    // Parsing a large SVG or PAT can take a while, so it happens on a worker.
+    // Only the most recent request is shown; quick keyboard navigation through
+    // the list skips the files in between.
+    const QPointer<MainWindow> self(this);
+    QThreadPool::globalInstance()->start([self, path, request] {
+        auto loaded = std::make_shared<Loaded>();
+        try {
+            loaded->pattern = load_pattern(toPath(path));
+            loaded->bounds = pattern_bounds(loaded->pattern);
+            for (const auto& move : loaded->pattern.moves)
+                move.gcode == 0 ? ++loaded->travel : ++loaded->stitch;
+        } catch (const std::exception& e) {
+            loaded->error = QString::fromUtf8(e.what());
+        }
+        if (!self) return;
+        QMetaObject::invokeMethod(self, [self, path, request, loaded] {
+            if (!self || request != self->open_request_) return;
+            self->loading_path_.clear();
+            if (!loaded->error.isEmpty()) {
+                QMessageBox::critical(self, tr("Could not load pattern"), loaded->error);
+                return;
+            }
+            const auto& bounds = loaded->bounds;
+            self->file_name_->setText(QFileInfo(path).fileName());
+            self->file_path_->setText(path);
+            self->dimensions_->setText(QString("%1 × %2 PAT units")
+                                           .arg(bounds.width(), 0, 'f', 3)
+                                           .arg(bounds.height(), 0, 'f', 3));
+            self->statistics_->setText(tr("%1 blocks · %2 stitch · %3 travel")
+                                           .arg(loaded->pattern.moves.size())
+                                           .arg(loaded->stitch).arg(loaded->travel));
+            QStringList lines;
+            for (const auto& c : loaded->pattern.comments) lines << QString::fromStdString(c);
+            self->comments_->setPlainText(lines.join('\n'));
+            self->keyword_edit_->setText(self->keywords_.value(path).toString());
+            self->canvas_->setPattern(std::move(loaded->pattern));
+            self->current_ = path;
+            self->setWindowTitle(tr("Innova PAT / QLI Viewer — %1").arg(QFileInfo(path).fileName()));
+            self->statusBar()->showMessage(tr("Loaded %1").arg(QFileInfo(path).fileName()));
+        }, Qt::QueuedConnection);
+    });
+}
+
+void MainWindow::closeCurrentFile() {
+    ++open_request_;  // a load still in flight must not reopen it
+    loading_path_.clear();
+    current_.clear();
+    canvas_->clear();
+    file_name_->setText("—");
+    file_path_->setText("—");
+    dimensions_->setText("—");
+    statistics_->clear();
+    comments_->clear();
+    keyword_edit_->clear();
+    setWindowTitle(tr("Innova PAT / QLI Viewer"));
 }
 
 void MainWindow::removeSelected() {
@@ -1004,6 +1144,7 @@ void MainWindow::removeSelected() {
     const QSet<QString> removing(paths.cbegin(), paths.cend());
     library_.removeIf([&removing](const QString& path) { return removing.contains(path); });
     for (const auto& path : paths) keywords_.remove(path);
+    if (removing.contains(current_)) closeCurrentFile();
     rebuildLibraryKeys();
     saveLibrary(); refreshList();
     statusBar()->showMessage(tr("Removed %1 file(s) from the library; disk files were not deleted.")
@@ -1011,13 +1152,29 @@ void MainWindow::removeSelected() {
 }
 
 void MainWindow::purgeMissing() {
-    int removed = 0;
-    for (auto it = library_.begin(); it != library_.end();)
-        if (!QFileInfo::exists(*it)) { keywords_.remove(*it); it = library_.erase(it); ++removed; }
-        else ++it;
-    rebuildLibraryKeys();
-    saveLibrary(); refreshList();
-    statusBar()->showMessage(tr("Purged %1 missing file(s) from the database.").arg(removed));
+    auto missing = std::make_shared<QSet<QString>>();
+    // Checking every file can be slow on network drives, so it runs on a worker.
+    runInBackground(tr("Purge Missing"), tr("Checking files…"),
+        [library = library_, missing](BackgroundJob& job) {
+            for (int i = 0; i < library.size() && !job.cancelled(); ++i) {
+                if (!QFileInfo::exists(library[i])) missing->insert(library[i]);
+                job.progress(i, library.size(),
+                             tr("Checking %1 of %2 files…").arg(i + 1).arg(library.size()));
+            }
+        },
+        [this, missing](bool cancelled) {
+            if (cancelled) {
+                statusBar()->showMessage(tr("Purge Missing was cancelled; nothing was removed."));
+                return;
+            }
+            library_.removeIf([&missing](const QString& path) { return missing->contains(path); });
+            for (const auto& path : std::as_const(*missing)) keywords_.remove(path);
+            if (missing->contains(current_)) closeCurrentFile();
+            rebuildLibraryKeys();
+            saveLibrary(); refreshList();
+            statusBar()->showMessage(
+                tr("Purged %1 missing file(s) from the database.").arg(missing->size()));
+        });
 }
 
 void MainWindow::resetDatabase() {
@@ -1025,9 +1182,8 @@ void MainWindow::resetDatabase() {
     if (QMessageBox::warning(this, tr("Reset Database"),
         tr("Remove all %1 file entries from the database?\n\nFiles on disk will not be deleted.\nThis cannot be undone.")
         .arg(library_.size()), QMessageBox::Yes | QMessageBox::No, QMessageBox::No) != QMessageBox::Yes) return;
-    library_.clear(); library_keys_.clear(); keywords_.clear(); current_.clear();
-    canvas_->clear(); file_name_->setText("—"); file_path_->setText("—");
-    dimensions_->setText("—"); statistics_->clear(); comments_->clear(); keyword_edit_->clear();
+    library_.clear(); library_keys_.clear(); keywords_.clear();
+    closeCurrentFile();
     search_->clear(); saveLibrary(); refreshList();
 }
 
@@ -1093,6 +1249,7 @@ void MainWindow::mergeDuplicates() {
                 report << "";
             }
             library_.removeIf([&removing](const QString& path) { return removing.contains(path); });
+            if (removing.contains(current_)) closeCurrentFile();
             rebuildLibraryKeys();
             saveLibrary(); refreshList();
             if (groups->isEmpty()) {
@@ -1165,17 +1322,6 @@ void MainWindow::showKeywordsList() {
     dialog.exec();
 }
 
-void MainWindow::convertCurrent(const QString& extension) {
-    if (current_.isEmpty()) return;
-    QString suggested = QFileInfo(current_).path() + '/' + QFileInfo(current_).completeBaseName() + extension;
-    const auto output = QFileDialog::getSaveFileName(this, tr("Save converted pattern"), suggested,
-        extension == ".pat" ? tr("Innova PAT (*.pat)") : tr("Statler QLI (*.qli)"));
-    if (output.isEmpty()) return;
-    try { convert_file(current_.toStdString(), output.toStdString()); addPath(output); saveLibrary();
-          refreshList(); openFile(QFileInfo(output).canonicalFilePath()); }
-    catch (const std::exception& e) { QMessageBox::critical(this, tr("Conversion failed"), e.what()); }
-}
-
 void MainWindow::convertSourceDialog(const QString& sourceExt, const QString& outputExt) {
     const auto sources = QFileDialog::getOpenFileNames(this, tr("Select file(s) to convert"), {},
         sourceExt == ".svg" ? tr("SVG Files (*.svg)") : tr("QLI Files (*.qli)"));
@@ -1187,7 +1333,7 @@ void MainWindow::convertSourceDialog(const QString& sourceExt, const QString& ou
         output = QFileDialog::getSaveFileName(this, tr("Save converted file"), output,
             outputExt == ".pat" ? tr("Innova PAT (*.pat)") : tr("Statler QLI (*.qli)"));
         if (output.isEmpty()) return;
-        try { convert_file(sources.first().toStdString(), output.toStdString()); addPath(output); }
+        try { convert_file(toPath(sources.first()), toPath(output)); addPath(output); }
         catch (const std::exception& e) { QMessageBox::warning(this, tr("Conversion failed"), e.what()); }
         saveLibrary(); refreshList();
         return;
@@ -1277,7 +1423,7 @@ void MainWindow::convertFiles(const QList<QPair<QString, QString>>& files, int e
                     continue;
                 }
                 try {
-                    convert_file(source.toStdString(), output.toStdString());
+                    convert_file(toPath(source), toPath(output));
                     outcome->converted << QFileInfo(output).canonicalFilePath();
                 } catch (const std::exception& e) {
                     outcome->failures << QString("%1: %2").arg(QDir::toNativeSeparators(source),

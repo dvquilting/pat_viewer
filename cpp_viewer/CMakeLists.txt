@@ -23,6 +23,10 @@ endif()
 
 add_executable(qpv-cli src/cli_main.cpp)
 target_link_libraries(qpv-cli PRIVATE qpv_core)
+if(WIN32)
+    # CommandLineToArgvW, for file names outside the ANSI code page.
+    target_link_libraries(qpv-cli PRIVATE shell32)
+endif()
 
 if(QPV_BUILD_GUI)
     find_package(Qt6 6.4 QUIET COMPONENTS Widgets)

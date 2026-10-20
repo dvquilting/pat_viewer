@@ -73,6 +73,8 @@ private:
     std::vector<int> shown_rows_;      // rows that match the search, in order
     std::vector<int> shown_position_;  // row -> index into shown_rows_, or -1
     QString current_;
+    QString loading_path_;   // being opened on a worker thread
+    quint64 open_request_{}; // only the latest openFile() request is shown
     // The one background job allowed at a time (see runInBackground).
     std::shared_ptr<std::atomic<bool>> job_cancel_;
     bool job_running_{};
@@ -132,6 +134,7 @@ private:
     void addPath(const QString& path);
     void scanFolder(const QString& folder);
     void openFile(const QString& path);
+    void closeCurrentFile();
     void removeSelected();
     void purgeMissing();
     void resetDatabase();
@@ -140,7 +143,6 @@ private:
     void saveCurrentKeywords();
     void applyBulkKeywords();
     void showKeywordsList();
-    void convertCurrent(const QString& extension);
     void convertSourceDialog(const QString& sourceExtension, const QString& outputExtension);
     void convertFolder(bool recursive);
     // `existing` is how many outputs already exist, or -1 to check here.
