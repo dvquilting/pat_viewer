@@ -85,7 +85,8 @@ double arc_sweep(double start, double end, bool ccw) noexcept {
         return v < 0.0 ? v + 360.0 : v;
     };
     double sweep = ccw ? positive_mod(end - start) : -positive_mod(start - end);
-    if (std::abs(sweep) < 1e-12) sweep = ccw ? 180.0 : -180.0;
+    // Coincident start and end angles mean a full circle, as in G-code.
+    if (std::abs(sweep) < 1e-12) sweep = ccw ? 360.0 : -360.0;
     return sweep;
 }
 
@@ -189,7 +190,16 @@ void write_pat(const Pattern& pattern, const std::filesystem::path& path) {
         out << 'N' << std::setw(2) << std::setfill('0') << *pattern.end_sequence
             << "M02\r\n";
     }
-    for (const auto& comment : pattern.comments) out << "( " << comment << " )\r\n";
+    for (auto comment : pattern.comments) {
+        // Keep each comment on one line and inside a single pair of parentheses,
+        // so its text can never be read back as a command.
+        for (char& c : comment) {
+            if (c == '\r' || c == '\n') c = ' ';
+            else if (c == '(') c = '[';
+            else if (c == ')') c = ']';
+        }
+        out << "( " << comment << " )\r\n";
+    }
     if (!out) throw std::runtime_error("Error writing PAT file: " + path.string());
 }
 

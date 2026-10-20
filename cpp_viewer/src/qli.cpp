@@ -1,6 +1,7 @@
 #include "qpv/io.hpp"
 
 #include <algorithm>
+#include <charconv>
 #include <cmath>
 #include <cctype>
 #include <fstream>
@@ -29,10 +30,17 @@ std::string upper(std::string value) {
 
 double number(std::string token) {
     token = trim(std::move(token));
-    if (token.rfind("@RND[", 0) == 0) token.erase(0, 5);
-    const auto junk = token.find_first_of("]\r\n*+<>");
+    if (token.rfind("@RND[", 0) == 0) token = trim(token.substr(5));
+    // Search from 1 so that a leading sign is kept.
+    const auto junk = token.find_first_of("]\r\n*+<>", 1);
     if (junk != std::string::npos) token.resize(junk);
-    try { return std::stod(token); } catch (...) { return 0.0; }
+    // std::from_chars ignores the C locale, unlike std::stod.
+    const char* begin = token.data();
+    const char* end = begin + token.size();
+    if (begin != end && *begin == '+') ++begin;
+    double value{};
+    const auto result = std::from_chars(begin, end, value);
+    return result.ec == std::errc{} && std::isfinite(value) ? value : 0.0;
 }
 
 std::vector<std::string> arguments(std::string_view text) {
@@ -159,8 +167,10 @@ void write_qli(const Pattern& pattern, const std::filesystem::path& path) {
     std::ofstream out(path, std::ios::binary);
     if (!out) throw std::runtime_error("Cannot write QLI file: " + path.string());
     for (auto comment : pattern.comments) {
-        std::replace(comment.begin(), comment.end(), '\r', ' ');
-        std::replace(comment.begin(), comment.end(), '\n', ' ');
+        // ';' separates QLI commands, so it would turn the rest of the comment
+        // into commands when the file is read back.
+        std::replace_if(comment.begin(), comment.end(),
+                        [](char c) { return c == '\r' || c == '\n' || c == ';'; }, ' ');
         comment = trim(std::move(comment));
         if (!comment.empty()) out << "REM " << comment << "\r\n";
     }

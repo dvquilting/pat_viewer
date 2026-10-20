@@ -2,17 +2,15 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <charconv>
 #include <cmath>
-#include <cstdlib>
 #include <fstream>
 #include <numbers>
 #include <optional>
-#include <regex>
-#include <sstream>
 #include <stdexcept>
 #include <string>
-#include <unordered_map>
+#include <string_view>
 
 namespace qpv {
 namespace {
@@ -40,12 +38,123 @@ std::string lower(std::string value) {
     return value;
 }
 
+bool is_space(char c) { return std::isspace(static_cast<unsigned char>(c)) != 0; }
+
+bool is_name_char(char c) {
+    return std::isalnum(static_cast<unsigned char>(c)) || c == '-' || c == '_' ||
+           c == ':' || c == '.';
+}
+
+bool iequals(std::string_view a, std::string_view b) {
+    return a.size() == b.size() &&
+           std::equal(a.begin(), a.end(), b.begin(), [](char x, char y) {
+               return std::tolower(static_cast<unsigned char>(x)) ==
+                      std::tolower(static_cast<unsigned char>(y));
+           });
+}
+
+std::size_t ifind(std::string_view text, std::string_view needle, std::size_t from) {
+    for (std::size_t i = from; i + needle.size() <= text.size(); ++i)
+        if (iequals(text.substr(i, needle.size()), needle)) return i;
+    return std::string_view::npos;
+}
+
+std::string_view trim(std::string_view value) {
+    while (!value.empty() && is_space(value.front())) value.remove_prefix(1);
+    while (!value.empty() && is_space(value.back())) value.remove_suffix(1);
+    return value;
+}
+
+// Locale-independent replacement for strtod that also accepts a leading '+'.
+std::from_chars_result parse_double(const char* begin, const char* end, double& value) {
+    if (begin != end && *begin == '+' && (end - begin < 2 || begin[1] != '-')) ++begin;
+    return std::from_chars(begin, end, value);
+}
+
+// Finds the next start tag called `name` (e.g. "<path ...>") at or after `from`
+// and advances `from` past it. Quoted attribute values may contain '>'.
+// Hand-written because libstdc++'s std::regex recurses once per character and
+// overflows the stack on path data longer than a few kilobytes.
+std::string_view next_tag(std::string_view xml, std::string_view name, std::size_t& from) {
+    while (from < xml.size()) {
+        const auto open = xml.find('<', from);
+        if (open == std::string_view::npos) break;
+        from = open + 1;
+        const auto after = open + 1 + name.size();
+        if (after > xml.size() || !iequals(xml.substr(open + 1, name.size()), name) ||
+            (after < xml.size() && is_name_char(xml[after])))
+            continue;
+        char quote = 0;
+        for (auto i = after; i < xml.size(); ++i) {
+            const char c = xml[i];
+            if (quote) {
+                if (c == quote) quote = 0;
+            } else if (c == '"' || c == '\'') {
+                quote = c;
+            } else if (c == '>') {
+                from = i + 1;
+                return xml.substr(open, i - open + 1);
+            }
+        }
+        break;
+    }
+    from = xml.size();
+    return {};
+}
+
+// Returns the value of attribute `name` in a start tag, matching the whole
+// attribute name case-insensitively (so "width" never matches "stroke-width").
 std::string attribute(std::string_view tag, std::string_view name) {
-    const std::regex re(std::string(R"(\b)") + std::string(name) +
-                            R"(\s*=\s*(['"])(.*?)\1)",
-                        std::regex::icase);
-    std::match_results<std::string_view::const_iterator> m;
-    return std::regex_search(tag.begin(), tag.end(), m, re) ? std::string(m[2]) : "";
+    std::size_t i = 1;
+    while (i < tag.size() && is_name_char(tag[i])) ++i;  // element name
+    while (i < tag.size()) {
+        while (i < tag.size() && !is_name_char(tag[i])) ++i;
+        const auto name_begin = i;
+        while (i < tag.size() && is_name_char(tag[i])) ++i;
+        const auto attr = tag.substr(name_begin, i - name_begin);
+        while (i < tag.size() && is_space(tag[i])) ++i;
+        if (i >= tag.size() || tag[i] != '=') continue;
+        ++i;
+        while (i < tag.size() && is_space(tag[i])) ++i;
+        if (i >= tag.size()) break;
+        std::string_view value;
+        if (tag[i] == '"' || tag[i] == '\'') {
+            const auto close = tag.find(tag[i], i + 1);
+            if (close == std::string_view::npos) break;
+            value = tag.substr(i + 1, close - i - 1);
+            i = close + 1;
+        } else {
+            const auto begin = i;
+            while (i < tag.size() && !is_space(tag[i]) && tag[i] != '>') ++i;
+            value = tag.substr(begin, i - begin);
+        }
+        if (iequals(attr, name)) return std::string(value);
+    }
+    return {};
+}
+
+// True when argument `index` of any `function(...)` in the document is negative,
+// e.g. the second argument of scale() or the fourth of matrix().
+bool has_negative_argument(std::string_view xml, std::string_view function,
+                           std::size_t index) {
+    for (auto pos = ifind(xml, function, 0); pos != std::string_view::npos;
+         pos = ifind(xml, function, pos + 1)) {
+        auto i = pos + function.size();
+        while (i < xml.size() && is_space(xml[i])) ++i;
+        if (i >= xml.size() || xml[i] != '(') continue;
+        ++i;
+        for (std::size_t arg = 0;; ++arg) {
+            while (i < xml.size() && (is_space(xml[i]) || xml[i] == ',')) ++i;
+            if (i >= xml.size() || xml[i] == ')') break;
+            const auto begin = i;
+            while (i < xml.size() && !is_space(xml[i]) && xml[i] != ',' && xml[i] != ')') ++i;
+            if (arg == index) {
+                if (xml[begin] == '-') return true;
+                break;
+            }
+        }
+    }
+    return false;
 }
 
 double point_line_distance(Point p, Point a, Point b) {
@@ -100,12 +209,20 @@ public:
     double number() {
         skip();
         if (pos_ >= text_.size()) throw std::runtime_error("Missing SVG path number");
-        const char* begin = text_.data() + pos_;
-        char* end = nullptr;
-        const double value = std::strtod(begin, &end);
-        if (end == begin) throw std::runtime_error("Invalid SVG path number");
-        pos_ = static_cast<std::size_t>(end - text_.data());
+        double value{};
+        const auto result =
+            parse_double(text_.data() + pos_, text_.data() + text_.size(), value);
+        if (result.ec != std::errc{} || !std::isfinite(value))
+            throw std::runtime_error("Invalid SVG path number");
+        pos_ = static_cast<std::size_t>(result.ptr - text_.data());
         return value;
+    }
+    // Arc flags are single characters, so "0110" is two flags followed by 10.
+    bool flag() {
+        skip();
+        if (pos_ < text_.size() && (text_[pos_] == '0' || text_[pos_] == '1'))
+            return text_[pos_++] == '1';
+        throw std::runtime_error("Invalid SVG arc flag");
     }
 
 private:
@@ -233,11 +350,11 @@ void parse_path(const std::string& data, double tolerance, std::vector<Raw>& raw
         } else if (op == 'A') {
             const double rx = tokens.number(), ry = tokens.number();
             const double rotation = tokens.number();
-            const bool large = tokens.number() != 0.0, sweep = tokens.number() != 0.0;
+            const bool large = tokens.flag(), sweep = tokens.flag();
             const Point end = point(relative);
             const auto arc = endpoint_arc(current, end, rx, ry, rotation, large, sweep);
             if (!arc) stitch(end);
-            else if (std::abs(arc->rx - arc->ry) <= std::max(0.5, 0.02 * arc->rx)) {
+            else if (std::abs(arc->rx - arc->ry) <= 0.02 * std::max(arc->rx, arc->ry)) {
                 raw.push_back({Raw::Kind::Arc, current, end, arc->center, sweep ? 2 : 3});
                 current = end;
             } else {
@@ -252,21 +369,22 @@ void parse_path(const std::string& data, double tolerance, std::vector<Raw>& raw
     }
 }
 
-double dimension_px(const std::string& text) {
-    static const std::regex re(R"(^\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+))\s*(px|pt|mm|cm|in)?\s*$)",
-                               std::regex::icase);
-    std::smatch m;
-    if (!std::regex_match(text, m, re)) return 0.0;
-    const double value = std::stod(m[1].str());
-    const auto unit = lower(m[2].str());
+double dimension_px(std::string_view text) {
+    text = trim(text);
+    double value{};
+    const auto result = parse_double(text.data(), text.data() + text.size(), value);
+    if (result.ec != std::errc{} || !std::isfinite(value)) return 0.0;
+    const auto unit = lower(std::string(trim(
+        text.substr(static_cast<std::size_t>(result.ptr - text.data())))));
     if (unit == "pt") return value * 96.0 / 72.0;
     if (unit == "mm") return value * 96.0 / 25.4;
     if (unit == "cm") return value * 96.0 / 2.54;
     if (unit == "in") return value * 96.0;
-    return value;
+    if (unit.empty() || unit == "px") return value;
+    return 0.0;
 }
 
-bool decorative(const std::string& tag) {
+bool decorative(std::string_view tag) {
     static const std::array<std::string_view, 18> colors{
         "red","green","blue","yellow","cyan","magenta","lime","fuchsia",
         "aqua","orange","purple","gray","grey","silver","maroon","navy","teal","olive"};
@@ -286,37 +404,35 @@ Pattern read_svg(const std::filesystem::path& path, double bezier_tolerance) {
     if (!in) throw std::runtime_error("Cannot open SVG file: " + path.string());
     const std::string xml((std::istreambuf_iterator<char>(in)), {});
 
-    const auto svg_begin = xml.find("<svg");
-    const auto svg_end = svg_begin == std::string::npos ? std::string::npos : xml.find('>', svg_begin);
-    const std::string root = svg_end == std::string::npos ? "" :
-        xml.substr(svg_begin, svg_end - svg_begin + 1);
+    std::size_t cursor = 0;
+    const std::string_view root = next_tag(xml, "svg", cursor);
     const double width_px = dimension_px(attribute(root, "width"));
     const double height_px = dimension_px(attribute(root, "height"));
     double vb_w = 0.0, vb_h = 0.0;
     {
         const auto vb = attribute(root, "viewBox");
-        std::string normalized = vb;
-        std::replace(normalized.begin(), normalized.end(), ',', ' ');
-        std::istringstream ss(normalized);
-        double x{}, y{};
-        ss >> x >> y >> vb_w >> vb_h;
+        PathTokens tokens(vb);
+        try {
+            tokens.number();
+            tokens.number();
+            vb_w = tokens.number();
+            vb_h = tokens.number();
+        } catch (const std::runtime_error&) {
+            // Missing or malformed viewBox: keep whatever was parsed.
+        }
     }
     std::optional<double> svg_scale;
     if (width_px > 0.0 && vb_w > 0.0) svg_scale = width_px / vb_w / 96.0;
     else if (height_px > 0.0 && vb_h > 0.0) svg_scale = height_px / vb_h / 96.0;
 
-    static const std::regex neg_matrix(
-        R"(matrix\s*\(\s*[^, ]+[\s,]+[^, ]+[\s,]+[^, ]+[\s,]+-\s*[0-9.]+)",
-        std::regex::icase);
-    static const std::regex neg_scale(
-        R"(scale\s*\(\s*[^, )]+[\s,]+-\s*[0-9.]+)", std::regex::icase);
-    const bool y_up = std::regex_search(xml, neg_matrix) || std::regex_search(xml, neg_scale);
+    const bool y_up = has_negative_argument(xml, "matrix", 3) ||
+                      has_negative_argument(xml, "scale", 1);
 
     std::vector<Raw> raw;
     raw.reserve(4096);
-    static const std::regex path_re(R"(<path\b[^>]*>)", std::regex::icase);
-    for (std::sregex_iterator it(xml.begin(), xml.end(), path_re), end; it != end; ++it) {
-        const std::string tag = it->str();
+    cursor = 0;
+    for (std::string_view tag = next_tag(xml, "path", cursor); !tag.empty();
+         tag = next_tag(xml, "path", cursor)) {
         if (decorative(tag)) continue;
         const std::string d = attribute(tag, "d");
         if (!d.empty()) {

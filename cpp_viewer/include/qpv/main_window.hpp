@@ -4,11 +4,16 @@
 
 #include <QColor>
 #include <QHash>
+#include <QIcon>
 #include <QImage>
 #include <QMainWindow>
 #include <QSet>
 #include <QStringList>
 #include <QVariantMap>
+
+#include <atomic>
+#include <memory>
+#include <vector>
 
 class QCheckBox;
 class QLabel;
@@ -54,9 +59,20 @@ private:
     QLineEdit* bulk_keyword_edit_{};
     QLabel* list_status_{};
     QStringList library_;
+    // Case-folded library paths, for constant-time duplicate checks.
+    QSet<QString> library_keys_;
     QVariantMap keywords_;
-    QStringList filtered_;
+    // Every library path in display order; the active list has one item per
+    // entry, and searching hides rows instead of rebuilding the list.
+    QStringList rows_;
+    QStringList row_names_;
+    QHash<QString, int> row_of_;
+    std::vector<char> row_hidden_;
+    std::vector<int> shown_rows_;      // rows that match the search, in order
+    std::vector<int> shown_position_;  // row -> index into shown_rows_, or -1
     QString current_;
+    std::shared_ptr<std::atomic<bool>> scan_cancel_;
+    bool scanning_{};
     int view_mode_{};
     QColor line_color_{Qt::black};
     QThreadPool* thumbnail_pool_{};
@@ -64,33 +80,47 @@ private:
     QTimer* thumbnail_timer_{};
     QTimer* background_thumbnail_timer_{};
     int background_thumbnail_cursor_{};
+    int background_batches_inflight_{};
     int thumbnail_worker_count_{};
     int max_background_thumbnails_{};
     quint64 thumbnail_generation_{};
+    // Shared with worker tasks so queued background work stops after invalidation.
+    std::shared_ptr<std::atomic<quint64>> live_generation_{
+        std::make_shared<std::atomic<quint64>>(0)};
+    QString thumbnail_cache_dir_;
+    QIcon placeholder_icon_;
     QSet<QString> thumbnail_inflight_;
-    QSet<QString> background_thumbnail_inflight_;
     QSet<QString> thumbnail_loaded_;
-    QHash<QString, QListWidgetItem*> thumbnail_items_;
-    QHash<QString, QListWidgetItem*> keyword_items_;
+    QSet<QString> thumbnail_failed_;
+    // Rows whose icons stay in memory; icons outside this window are released.
+    int keep_first_row_{};
+    int keep_last_row_{-1};
 
     void buildUi();
     void buildMenus();
     void loadLibrary();
     void saveLibrary() const;
+    void rebuildLibraryKeys();
+    int addCanonicalPaths(const QStringList& paths);
     void refreshList();
     void populateView();
+    void applyFilter();
+    QListWidget* activeList() const;
+    QListWidgetItem* itemForPath(const QString& path) const;
+    QString itemToolTip(const QString& path) const;
+    void selectAllVisible();
     void setViewMode(int mode);
     void invalidateThumbnails();
     void scheduleVisibleThumbnails();
     void scheduleVisibleThumbnails(QListWidget* target);
     void scheduleNextBackgroundThumbnail();
-    void requestThumbnail(const QString& path, QListWidget* target,
-                          int priority, bool background = false);
+    void requestThumbnail(const QString& path, QListWidget* target, int priority);
+    void evictThumbnails(QListWidget* target);
     void applyThumbnail(const QString& path, const QImage& image, QListWidget* target);
-    QString thumbnailPath(const QString& path) const;
     void addFiles();
     void addFolder();
     void addPath(const QString& path);
+    void scanFolder(const QString& folder);
     void openFile(const QString& path);
     void removeSelected();
     void purgeMissing();

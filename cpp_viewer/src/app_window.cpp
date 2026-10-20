@@ -5,6 +5,7 @@
 
 #include <QActionGroup>
 #include <QApplication>
+#include <QBuffer>
 #include <QCheckBox>
 #include <QColorDialog>
 #include <QCryptographicHash>
@@ -12,6 +13,7 @@
 #include <QDialogButtonBox>
 #include <QDir>
 #include <QDirIterator>
+#include <QElapsedTimer>
 #include <QFile>
 #include <QFileDialog>
 #include <QFileInfo>
@@ -19,6 +21,7 @@
 #include <QGroupBox>
 #include <QHBoxLayout>
 #include <QInputDialog>
+#include <QItemSelection>
 #include <QLabel>
 #include <QLineEdit>
 #include <QListWidget>
@@ -29,10 +32,13 @@
 #include <QPainterPath>
 #include <QPlainTextEdit>
 #include <QPointer>
+#include <QProgressDialog>
 #include <QPushButton>
 #include <QRunnable>
+#include <QSaveFile>
 #include <QScrollBar>
 #include <QSettings>
+#include <QSignalBlocker>
 #include <QSlider>
 #include <QSplitter>
 #include <QStackedWidget>
@@ -60,29 +66,108 @@ QString thumbnailCacheDirectory() {
     return root + "/thumbnails";
 }
 
-class ThumbnailTask final : public QRunnable {
+using Generation = std::shared_ptr<std::atomic<quint64>>;
+
+// Thread-safe: runs on thumbnail workers.
+QString thumbnailCachePath(const QString& cacheDir, const QString& path, const QColor& color) {
+    const QFileInfo info(path);
+    const QByteArray key = ("thumb-v2-thin|" + path + '|' +
+        QString::number(info.lastModified().toMSecsSinceEpoch()) +
+        '|' + QString::number(info.size()) + '|' + color.name()).toUtf8();
+    const auto digest = QCryptographicHash::hash(key, QCryptographicHash::Sha256).toHex();
+    return cacheDir + '/' + QString::fromLatin1(digest) + ".png";
+}
+
+// Writes via QSaveFile so another worker never reads a half-written PNG.
+void saveThumbnail(const QImage& image, const QString& cachePath) {
+    QByteArray png;
+    QBuffer buffer(&png);
+    buffer.open(QIODevice::WriteOnly);
+    // Quality 80 selects a faster PNG compression level while remaining
+    // lossless. It is also smaller than Qt's default for these line images.
+    if (!image.save(&buffer, "PNG", 80)) return;
+    // On Windows the rename in commit() fails now and then with a sharing
+    // violation while antivirus or the indexer briefly opens the new file.
+    for (int attempt = 0; attempt < 5; ++attempt) {
+        if (attempt) QThread::msleep(10u << attempt);
+        QSaveFile file(cachePath);
+        if (file.open(QIODevice::WriteOnly) && file.write(png) == png.size() && file.commit())
+            return;
+    }
+}
+
+template <typename Result>
+void deliver(const QPointer<QObject>& context,
+             const std::function<void(const Result&)>& done, Result result) {
+    if (context) QMetaObject::invokeMethod(context, [context, done, result = std::move(result)] {
+        if (context) done(result);
+    }, Qt::QueuedConnection);
+}
+
+// Produces one thumbnail for display, from the disk cache when possible.
+// The cache lookup and PNG decode happen here rather than on the GUI thread.
+class ThumbnailLoadTask final : public QRunnable {
 public:
-    ThumbnailTask(QString path, QString cachePath, QColor color, QPointer<QObject> context,
-                  std::function<void(const QImage&)> done)
-        : path_(std::move(path)), cache_path_(std::move(cachePath)), color_(color),
-          context_(context), done_(std::move(done)) {
+    ThumbnailLoadTask(QString path, QString cacheDir, QColor color, quint64 generation,
+                      Generation live, QPointer<QObject> context,
+                      std::function<void(const QImage&)> done)
+        : path_(std::move(path)), cache_dir_(std::move(cacheDir)), color_(color),
+          generation_(generation), live_(std::move(live)), context_(context),
+          done_(std::move(done)) {
         setAutoDelete(true);
     }
     void run() override {
-        QImage image = MainWindow::renderThumbnail(path_, color_);
-        // Quality 80 selects a faster PNG compression level while remaining
-        // lossless. It is also smaller than Qt's default for these line images.
-        if (!image.isNull()) image.save(cache_path_, "PNG", 80);
-        if (context_) QMetaObject::invokeMethod(context_, [context = context_, image, done = done_] {
-            if (context) done(image);
-        }, Qt::QueuedConnection);
+        if (live_->load() != generation_) return;
+        const QString cached = thumbnailCachePath(cache_dir_, path_, color_);
+        QImage image(cached);
+        if (image.isNull()) {
+            image = MainWindow::renderThumbnail(path_, color_);
+            if (!image.isNull()) saveThumbnail(image, cached);
+        }
+        deliver(context_, done_, image);
     }
 private:
     QString path_;
-    QString cache_path_;
+    QString cache_dir_;
     QColor color_;
+    quint64 generation_;
+    Generation live_;
     QPointer<QObject> context_;
     std::function<void(const QImage&)> done_;
+};
+
+// Fills the disk cache for a batch of files without decoding anything for
+// display, and reports the files that could not be rendered.
+class ThumbnailWarmTask final : public QRunnable {
+public:
+    ThumbnailWarmTask(QStringList paths, QString cacheDir, QColor color, quint64 generation,
+                      Generation live, QPointer<QObject> context,
+                      std::function<void(const QStringList&)> done)
+        : paths_(std::move(paths)), cache_dir_(std::move(cacheDir)), color_(color),
+          generation_(generation), live_(std::move(live)), context_(context),
+          done_(std::move(done)) {
+        setAutoDelete(true);
+    }
+    void run() override {
+        QStringList failed;
+        for (const auto& path : paths_) {
+            if (live_->load() != generation_) return;
+            const QString cached = thumbnailCachePath(cache_dir_, path, color_);
+            if (QFileInfo::exists(cached)) continue;
+            const QImage image = MainWindow::renderThumbnail(path, color_);
+            if (image.isNull()) failed << path;
+            else saveThumbnail(image, cached);
+        }
+        deliver(context_, done_, failed);
+    }
+private:
+    QStringList paths_;
+    QString cache_dir_;
+    QColor color_;
+    quint64 generation_;
+    Generation live_;
+    QPointer<QObject> context_;
+    std::function<void(const QStringList&)> done_;
 };
 
 QString fileDigest(const QString& path) {
@@ -111,6 +196,11 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     background_thumbnail_timer_ = new QTimer(this);
     background_thumbnail_timer_->setSingleShot(true);
     background_thumbnail_timer_->setInterval(background_thumbnail_delay_ms);
+    thumbnail_cache_dir_ = thumbnailCacheDirectory();
+    QDir().mkpath(thumbnail_cache_dir_);
+    QPixmap blank(thumbnail_size, thumbnail_size);
+    blank.fill(QColor(245, 245, 245));
+    placeholder_icon_ = QIcon(blank);
     buildUi();
     buildMenus();
     loadLibrary();
@@ -120,6 +210,7 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
 }
 
 MainWindow::~MainWindow() {
+    if (scan_cancel_) scan_cancel_->store(true);
     invalidateThumbnails();
     thumbnail_pool_->waitForDone();
 }
@@ -173,25 +264,30 @@ void MainWindow::buildUi() {
     view_stack_ = new QStackedWidget;
     files_ = new QListWidget;
     files_->setMinimumWidth(220);
+    files_->setUniformItemSizes(true);
     view_stack_->addWidget(files_);
 
+    // Every cell is the same size, and laying out in batches keeps the window
+    // responsive while thousands of items are positioned.
+    auto configureIconView = [](QListWidget* list) {
+        list->setViewMode(QListView::IconMode);
+        list->setIconSize({thumbnail_size, thumbnail_size});
+        list->setGridSize({150, 160});
+        list->setResizeMode(QListView::Adjust);
+        list->setMovement(QListView::Static);
+        list->setUniformItemSizes(true);
+        list->setLayoutMode(QListView::Batched);
+        list->setBatchSize(200);
+    };
     thumbnails_ = new QListWidget;
-    thumbnails_->setViewMode(QListView::IconMode);
-    thumbnails_->setIconSize({thumbnail_size, thumbnail_size});
-    thumbnails_->setGridSize({150, 160});
-    thumbnails_->setResizeMode(QListView::Adjust);
-    thumbnails_->setMovement(QListView::Static);
+    configureIconView(thumbnails_);
     view_stack_->addWidget(thumbnails_);
 
     auto* assignPage = new QWidget;
     auto* assignLayout = new QVBoxLayout(assignPage);
     assignLayout->setContentsMargins(0, 0, 0, 0);
     keyword_grid_ = new QListWidget;
-    keyword_grid_->setViewMode(QListView::IconMode);
-    keyword_grid_->setIconSize({thumbnail_size, thumbnail_size});
-    keyword_grid_->setGridSize({150, 160});
-    keyword_grid_->setResizeMode(QListView::Adjust);
-    keyword_grid_->setMovement(QListView::Static);
+    configureIconView(keyword_grid_);
     keyword_grid_->setSelectionMode(QAbstractItemView::ExtendedSelection);
     assignLayout->addWidget(keyword_grid_, 1);
     auto* selectRow = new QHBoxLayout;
@@ -267,11 +363,11 @@ void MainWindow::buildUi() {
             [this](int value) { canvas_->setLineWidth(value / 100.0); });
     connect(search_, &QLineEdit::textChanged, search_timer_,
             qOverload<>(&QTimer::start));
-    connect(search_timer_, &QTimer::timeout, this, &MainWindow::refreshList);
+    connect(search_timer_, &QTimer::timeout, this, &MainWindow::applyFilter);
     auto scopeChanged = [this](bool) {
         if (!search_names_->isChecked() && !search_keywords_->isChecked())
             search_names_->setChecked(true);
-        refreshList();
+        applyFilter();
     };
     connect(search_names_, &QCheckBox::toggled, this, scopeChanged);
     connect(search_keywords_, &QCheckBox::toggled, this, scopeChanged);
@@ -289,7 +385,7 @@ void MainWindow::buildUi() {
     connect(keyword_grid_, &QListWidget::itemDoubleClicked, this,
             [this](QListWidgetItem* item) { openFile(item->data(Qt::UserRole).toString()); });
     connect(keyword_edit_, &QLineEdit::editingFinished, this, &MainWindow::saveCurrentKeywords);
-    connect(selectAll, &QPushButton::clicked, keyword_grid_, &QListWidget::selectAll);
+    connect(selectAll, &QPushButton::clicked, this, &MainWindow::selectAllVisible);
     connect(clearSelection, &QPushButton::clicked, keyword_grid_, &QListWidget::clearSelection);
     connect(apply, &QPushButton::clicked, this, &MainWindow::applyBulkKeywords);
     connect(bulk_keyword_edit_, &QLineEdit::returnPressed, this, &MainWindow::applyBulkKeywords);
@@ -349,7 +445,7 @@ void MainWindow::buildMenus() {
 void MainWindow::loadLibrary() {
     QSettings settings("OpenAI", "QuiltPatternViewer");
     library_ = settings.value("library").toStringList();
-    library_.removeDuplicates();
+    rebuildLibraryKeys();
     keywords_ = settings.value("keywords").toMap();
     line_color_ = QColor(settings.value("lineColor", "#000000").toString());
     canvas_->setLineColor(line_color_);
@@ -373,62 +469,132 @@ QString MainWindow::normalizeKeywords(const QString& value) {
     return result.join(", ");
 }
 
-void MainWindow::refreshList() {
-    filtered_.clear();
-    const auto needle = search_->text().trimmed();
-    for (const auto& path : library_) {
-        const bool nameMatch = search_names_->isChecked() &&
-            QFileInfo(path).fileName().contains(needle, Qt::CaseInsensitive);
-        const bool keywordMatch = search_keywords_->isChecked() &&
-            keywords_.value(path).toString().contains(needle, Qt::CaseInsensitive);
-        if (needle.isEmpty() || nameMatch || keywordMatch) filtered_ << path;
+void MainWindow::rebuildLibraryKeys() {
+    library_keys_.clear();
+    library_keys_.reserve(library_.size());
+    // Also drops entries that differ only in case, which addPath never adds.
+    library_.removeIf([this](const QString& path) {
+        const auto key = path.toCaseFolded();
+        if (library_keys_.contains(key)) return true;
+        library_keys_.insert(key);
+        return false;
+    });
+}
+
+int MainWindow::addCanonicalPaths(const QStringList& paths) {
+    int added = 0;
+    for (const auto& path : paths) {
+        if (path.isEmpty()) continue;
+        const auto key = path.toCaseFolded();
+        if (library_keys_.contains(key)) continue;
+        library_keys_.insert(key);
+        library_ << path;
+        ++added;
     }
-    filtered_.sort(Qt::CaseInsensitive);
+    return added;
+}
+
+// Call when the library's contents change; searching only calls applyFilter().
+void MainWindow::refreshList() {
+    rows_ = library_;
+    rows_.sort(Qt::CaseInsensitive);
     populateView();
-    list_status_->setText(tr("%1 matches / %2 total").arg(filtered_.size()).arg(library_.size()));
+}
+
+QListWidget* MainWindow::activeList() const {
+    return view_mode_ == 0 ? files_ : view_mode_ == 1 ? thumbnails_ : keyword_grid_;
+}
+
+QListWidgetItem* MainWindow::itemForPath(const QString& path) const {
+    const int row = row_of_.value(path, -1);
+    return row < 0 ? nullptr : activeList()->item(row);
+}
+
+QString MainWindow::itemToolTip(const QString& path) const {
+    const auto words = keywords_.value(path).toString();
+    return words.isEmpty() ? path : path + "\nKeywords: " + words;
 }
 
 void MainWindow::populateView() {
     invalidateThumbnails();
-    thumbnail_items_.clear();
-    keyword_items_.clear();
-    auto populate = [this](QListWidget* list, bool icons) {
-        list->clear();
-        for (const auto& path : filtered_) {
-            auto* item = new QListWidgetItem(QFileInfo(path).fileName(), list);
-            item->setData(Qt::UserRole, path);
-            item->setToolTip(path + (keywords_.value(path).toString().isEmpty() ? "" :
-                "\nKeywords: " + keywords_.value(path).toString()));
-            if (icons) {
-                if (list == thumbnails_) thumbnail_items_.insert(path, item);
-                else keyword_items_.insert(path, item);
-            } else {
-                const auto ext = QFileInfo(path).suffix().toLower();
-                item->setForeground(ext == "pat" ? QColor(0, 120, 40) :
-                                    ext == "qli" ? QColor(30, 90, 190) : QColor(145, 85, 25));
-            }
+    QListWidget* list = activeList();
+    const bool icons = view_mode_ != 0;
+    // Only the active view holds items; the others are rebuilt when shown.
+    for (auto* other : {files_, thumbnails_, keyword_grid_})
+        if (other != list) other->clear();
+    list->clear();
+    row_names_.clear();
+    row_names_.reserve(rows_.size());
+    row_of_.clear();
+    row_of_.reserve(rows_.size());
+    for (int row = 0; row < rows_.size(); ++row) {
+        const QString& path = rows_.at(row);
+        const QFileInfo info(path);
+        row_names_ << info.fileName();
+        row_of_.insert(path, row);
+        auto* item = new QListWidgetItem(row_names_.back(), list);
+        item->setData(Qt::UserRole, path);
+        item->setToolTip(itemToolTip(path));
+        if (icons) {
+            item->setIcon(placeholder_icon_);
+        } else {
+            const auto ext = info.suffix().toLower();
+            item->setForeground(ext == "pat" ? QColor(0, 120, 40) :
+                                ext == "qli" ? QColor(30, 90, 190) : QColor(145, 85, 25));
         }
-        if (!current_.isEmpty()) {
-            QListWidgetItem* item = nullptr;
-            if (list == thumbnails_) item = thumbnail_items_.value(current_);
-            else if (list == keyword_grid_) item = keyword_items_.value(current_);
-            else {
-                for (int i = 0; i < list->count(); ++i)
-                    if (list->item(i)->data(Qt::UserRole).toString() == current_) {
-                        item = list->item(i); break;
-                    }
-            }
-            if (item) item->setSelected(true);
+    }
+    row_hidden_.assign(static_cast<std::size_t>(rows_.size()), 0);
+    if (auto* item = itemForPath(current_)) {
+        // Make it current, so keyboard navigation continues from it, without
+        // reopening the file.
+        const QSignalBlocker blocker(list);
+        list->setCurrentItem(item);
+    }
+    applyFilter();
+}
+
+void MainWindow::applyFilter() {
+    QListWidget* list = activeList();
+    const auto needle = search_->text().trimmed();
+    const bool names = search_names_->isChecked();
+    const bool words = search_keywords_->isChecked();
+    shown_rows_.clear();
+    shown_position_.assign(static_cast<std::size_t>(rows_.size()), -1);
+    for (int row = 0; row < rows_.size(); ++row) {
+        const bool match = needle.isEmpty() ||
+            (names && row_names_.at(row).contains(needle, Qt::CaseInsensitive)) ||
+            (words && keywords_.value(rows_.at(row)).toString()
+                          .contains(needle, Qt::CaseInsensitive));
+        if (match) {
+            shown_position_[row] = static_cast<int>(shown_rows_.size());
+            shown_rows_.push_back(row);
         }
-    };
-    if (view_mode_ == 0) populate(files_, false);
-    else if (view_mode_ == 1) populate(thumbnails_, true);
-    else populate(keyword_grid_, true);
-    background_thumbnail_cursor_ = 0;
+        const char hide = match ? 0 : 1;
+        if (row_hidden_[row] == hide) continue;
+        row_hidden_[row] = hide;
+        // Hidden items must not stay selected, or bulk actions would reach them.
+        if (hide && list->item(row)->isSelected()) list->item(row)->setSelected(false);
+        list->setRowHidden(row, hide);
+    }
+    list_status_->setText(tr("%1 matches / %2 total").arg(shown_rows_.size()).arg(library_.size()));
     if (view_mode_ != 0) {
+        background_thumbnail_cursor_ = 0;
         thumbnail_timer_->start(0);
         background_thumbnail_timer_->start(250);
     }
+}
+
+void MainWindow::selectAllVisible() {
+    // QAbstractItemView::selectAll() would also select rows hidden by the search.
+    QItemSelection selection;
+    const auto* model = keyword_grid_->model();
+    for (std::size_t i = 0; i < shown_rows_.size();) {
+        std::size_t j = i;
+        while (j + 1 < shown_rows_.size() && shown_rows_[j + 1] == shown_rows_[j] + 1) ++j;
+        selection.select(model->index(shown_rows_[i], 0), model->index(shown_rows_[j], 0));
+        i = j + 1;
+    }
+    keyword_grid_->selectionModel()->select(selection, QItemSelectionModel::ClearAndSelect);
 }
 
 void MainWindow::setViewMode(int mode) {
@@ -439,12 +605,15 @@ void MainWindow::setViewMode(int mode) {
 
 void MainWindow::invalidateThumbnails() {
     ++thumbnail_generation_;
+    live_generation_->store(thumbnail_generation_);
     thumbnail_timer_->stop();
     background_thumbnail_timer_->stop();
     thumbnail_pool_->clear();
     thumbnail_inflight_.clear();
-    background_thumbnail_inflight_.clear();
+    background_batches_inflight_ = 0;
     thumbnail_loaded_.clear();
+    keep_first_row_ = 0;
+    keep_last_row_ = -1;
 }
 
 void MainWindow::scheduleVisibleThumbnails() {
@@ -453,101 +622,130 @@ void MainWindow::scheduleVisibleThumbnails() {
 }
 
 void MainWindow::scheduleVisibleThumbnails(QListWidget* target) {
-    if (!target || target->count() == 0 || !target->isVisible()) return;
-    target->doItemsLayout();
+    if (!target || shown_rows_.empty() || !target->isVisible()) return;
     const QRect area = target->viewport()->rect();
-    QModelIndex first = target->indexAt(area.topLeft() + QPoint(6, 6));
-    QModelIndex last = target->indexAt(area.bottomRight() - QPoint(6, 6));
-    int firstRow = first.isValid() ? first.row() : 0;
-    int lastRow = last.isValid() ? last.row() :
-        std::min(target->count() - 1, firstRow + 40);
-    const int visibleFirstRow = firstRow;
-    const int visibleLastRow = lastRow;
+    const QSize grid = target->gridSize();
+    const int columns = std::max(1, area.width() / std::max(1, grid.width()));
+    const int perPage = columns * (area.height() / std::max(1, grid.height()) + 2);
+    // Scan across a line of the viewport so a gap between cells is not
+    // mistaken for the absence of items.
+    auto rowsAt = [&](int y) {
+        int lowest = -1, highest = -1;
+        for (int x = 6; x < area.width(); x += std::max(8, grid.width() / 2)) {
+            const QModelIndex index = target->indexAt(QPoint(x, y));
+            if (!index.isValid()) continue;
+            if (lowest < 0 || index.row() < lowest) lowest = index.row();
+            highest = std::max(highest, index.row());
+        }
+        return std::pair{lowest, highest};
+    };
+    // Positions below count only rows that match the search (shown_rows_);
+    // indexAt() never returns a hidden row.
+    auto shownPosition = [this](int row) { return row < 0 ? -1 : shown_position_[row]; };
+    int first = shownPosition(rowsAt(6).first);
+    if (first < 0) first = shownPosition(rowsAt(grid.height() / 2).first);
+    if (first < 0) {
+        // The batched layout has not reached the visible rows yet.
+        if (target->verticalScrollBar()->value() != 0) {
+            thumbnail_timer_->start(60);
+            return;
+        }
+        first = 0;
+    }
+    int last = shownPosition(rowsAt(area.height() - 6).second);
+    if (last < 0) last = shownPosition(rowsAt(area.height() - grid.height() / 2).second);
+    if (last < first) last = first + perPage;
+    const int lastPosition = static_cast<int>(shown_rows_.size()) - 1;
+    last = std::min(lastPosition, last);
+
+    // Icons a few pages away from the viewport are released, so memory stays
+    // bounded however large the library is.
+    const int keep = std::max(100, 4 * perPage);
+    keep_first_row_ = shown_rows_[std::max(0, first - keep)];
+    keep_last_row_ = shown_rows_[std::min(lastPosition, last + keep)];
+    evictThumbnails(target);
+
     // A small prefetch margin keeps normal scrolling smooth without rendering
     // thousands of off-screen files.
-    firstRow = std::max(0, firstRow - 20);
-    lastRow = std::min(target->count() - 1, lastRow + 30);
-    for (int row = firstRow; row <= lastRow; ++row) {
-        const int priority =
-            row >= visibleFirstRow && row <= visibleLastRow ? 10 : 5;
-        requestThumbnail(target->item(row)->data(Qt::UserRole).toString(),
-                         target, priority);
+    const int prefetch = std::max(20, perPage);
+    const int firstToLoad = std::max(0, first - prefetch);
+    const int lastToLoad = std::min(lastPosition, last + prefetch);
+    for (int position = firstToLoad; position <= lastToLoad; ++position) {
+        const int priority = position >= first && position <= last ? 10 : 5;
+        requestThumbnail(rows_.at(shown_rows_[position]), target, priority);
     }
 }
 
 void MainWindow::scheduleNextBackgroundThumbnail() {
-    if (view_mode_ == 0 || background_thumbnail_cursor_ >= filtered_.size()) return;
+    if (view_mode_ == 0) return;
 
-    // Background jobs use fewer than half the pool, reserving most workers for
-    // newly visible high-priority items even while the cache is being filled.
-    if (background_thumbnail_inflight_.size() >= max_background_thumbnails_) {
-        background_thumbnail_timer_->start(background_thumbnail_delay_ms);
-        return;
+    // Background batches only fill the disk cache; nothing is decoded for
+    // display, so filling a large library costs no GUI time or memory. They use
+    // fewer than half the pool, reserving most workers for visible items.
+    constexpr int batch_size = 16;
+    const int shown = static_cast<int>(shown_rows_.size());
+    while (background_batches_inflight_ < max_background_thumbnails_ &&
+           background_thumbnail_cursor_ < shown) {
+        QStringList batch;
+        while (batch.size() < batch_size && background_thumbnail_cursor_ < shown) {
+            const QString& path = rows_.at(shown_rows_[background_thumbnail_cursor_++]);
+            if (!thumbnail_loaded_.contains(path) && !thumbnail_inflight_.contains(path) &&
+                !thumbnail_failed_.contains(path))
+                batch << path;
+        }
+        if (batch.isEmpty()) continue;
+        ++background_batches_inflight_;
+        const auto generation = thumbnail_generation_;
+        thumbnail_pool_->start(new ThumbnailWarmTask(
+            batch, thumbnail_cache_dir_, line_color_, generation, live_generation_, this,
+            [this, generation](const QStringList& failed) {
+                if (generation != thumbnail_generation_) return;
+                --background_batches_inflight_;
+                for (const auto& path : failed) thumbnail_failed_.insert(path);
+                background_thumbnail_timer_->start(background_thumbnail_delay_ms);
+            }), -10);
     }
-
-    QListWidget* target = view_mode_ == 1 ? thumbnails_ : keyword_grid_;
-    constexpr int cached_scan_batch = 32;
-    int scanned = 0;
-    while (background_thumbnail_cursor_ < filtered_.size() &&
-           scanned < cached_scan_batch &&
-           background_thumbnail_inflight_.size() < max_background_thumbnails_) {
-        const QString path = filtered_.at(background_thumbnail_cursor_++);
-        ++scanned;
-        requestThumbnail(path, target, -10, true);
-    }
-
-    if (background_thumbnail_cursor_ < filtered_.size() &&
-        background_thumbnail_inflight_.size() < max_background_thumbnails_)
-        background_thumbnail_timer_->start(25);
 }
 
-QString MainWindow::thumbnailPath(const QString& path) const {
-    const QFileInfo info(path);
-    const QByteArray key = ("thumb-v2-thin|" + path + '|' +
-        QString::number(info.lastModified().toMSecsSinceEpoch()) +
-        '|' + QString::number(info.size()) + '|' + line_color_.name()).toUtf8();
-    const auto digest = QCryptographicHash::hash(key, QCryptographicHash::Sha256).toHex();
-    const auto dir = thumbnailCacheDirectory();
-    if (!QDir().mkpath(dir)) return {};
-    return dir + '/' + QString::fromLatin1(digest) + ".png";
-}
-
-void MainWindow::requestThumbnail(const QString& path, QListWidget* target,
-                                  int priority, bool background) {
-    if (thumbnail_loaded_.contains(path)) return;
-    const auto cached = thumbnailPath(path);
-    QImage image(cached);
-    if (!image.isNull()) {
-        thumbnail_loaded_.insert(path);
-        applyThumbnail(path, image, target);
+void MainWindow::requestThumbnail(const QString& path, QListWidget* target, int priority) {
+    if (thumbnail_loaded_.contains(path) || thumbnail_inflight_.contains(path) ||
+        thumbnail_failed_.contains(path))
         return;
-    }
-    if (thumbnail_inflight_.contains(path)) return;
     thumbnail_inflight_.insert(path);
-    if (background) background_thumbnail_inflight_.insert(path);
-    auto* item = target == thumbnails_ ? thumbnail_items_.value(path) : keyword_items_.value(path);
-    if (item) {
-        QImage blank(thumbnail_size, thumbnail_size, QImage::Format_ARGB32_Premultiplied);
-        blank.fill(QColor(245, 245, 245));
-        item->setIcon(QPixmap::fromImage(blank));
-    }
     const auto generation = thumbnail_generation_;
-    auto* task = new ThumbnailTask(path, cached, line_color_, this,
-        [this, path, target = QPointer<QListWidget>(target), generation](const QImage& rendered) {
+    auto* task = new ThumbnailLoadTask(path, thumbnail_cache_dir_, line_color_, generation,
+        live_generation_, this,
+        [this, path, target = QPointer<QListWidget>(target), generation](const QImage& image) {
             if (generation != thumbnail_generation_) return;
             thumbnail_inflight_.remove(path);
-            background_thumbnail_inflight_.remove(path);
-            if (!rendered.isNull()) thumbnail_loaded_.insert(path);
-            if (!rendered.isNull() && target) applyThumbnail(path, rendered, target);
-            if (view_mode_ != 0)
-                background_thumbnail_timer_->start(background_thumbnail_delay_ms);
+            if (image.isNull()) {
+                thumbnail_failed_.insert(path);
+                return;
+            }
+            // The user may have scrolled away while this was loading.
+            const int row = row_of_.value(path, -1);
+            if (!target || row < keep_first_row_ || row > keep_last_row_) return;
+            thumbnail_loaded_.insert(path);
+            applyThumbnail(path, image, target);
         });
     thumbnail_pool_->start(task, priority);
 }
 
+void MainWindow::evictThumbnails(QListWidget* target) {
+    for (auto it = thumbnail_loaded_.begin(); it != thumbnail_loaded_.end();) {
+        const int row = row_of_.value(*it, -1);
+        if (row >= keep_first_row_ && row <= keep_last_row_) {
+            ++it;
+            continue;
+        }
+        if (auto* item = target->item(row)) item->setIcon(placeholder_icon_);
+        it = thumbnail_loaded_.erase(it);
+    }
+}
+
 void MainWindow::applyThumbnail(const QString& path, const QImage& image, QListWidget* target) {
-    auto* item = target == thumbnails_ ? thumbnail_items_.value(path) : keyword_items_.value(path);
-    if (item) item->setIcon(QPixmap::fromImage(image));
+    if (auto* item = target->item(row_of_.value(path, -1)))
+        item->setIcon(QPixmap::fromImage(image));
 }
 
 QImage MainWindow::renderThumbnail(const QString& path, const QColor& color) {
@@ -592,8 +790,7 @@ QImage MainWindow::renderThumbnail(const QString& path, const QColor& color) {
 void MainWindow::addPath(const QString& path) {
     QFileInfo info(path);
     if (!info.isFile() || !is_supported_file(info.absoluteFilePath().toStdString())) return;
-    const auto canonical = info.canonicalFilePath();
-    if (!library_.contains(canonical, Qt::CaseInsensitive)) library_ << canonical;
+    addCanonicalPaths({info.canonicalFilePath()});
 }
 
 void MainWindow::addFiles() {
@@ -605,10 +802,62 @@ void MainWindow::addFiles() {
 
 void MainWindow::addFolder() {
     const auto folder = QFileDialog::getExistingDirectory(this, tr("Add pattern folder"));
-    if (folder.isEmpty()) return;
-    QDirIterator it(folder, {"*.pat", "*.qli", "*.svg"}, QDir::Files, QDirIterator::Subdirectories);
-    while (it.hasNext()) addPath(it.next());
-    saveLibrary(); refreshList();
+    if (!folder.isEmpty()) scanFolder(folder);
+}
+
+void MainWindow::scanFolder(const QString& folder) {
+    if (scanning_) {
+        statusBar()->showMessage(tr("A folder is already being added."));
+        return;
+    }
+    scanning_ = true;
+    auto cancel = std::make_shared<std::atomic<bool>>(false);
+    scan_cancel_ = cancel;
+    const QString shownFolder = QDir::toNativeSeparators(folder);
+    auto* progress = new QProgressDialog(tr("Scanning %1…").arg(shownFolder), tr("Cancel"),
+                                         0, 0, this);
+    progress->setWindowTitle(tr("Add Folder"));
+    progress->setWindowModality(Qt::WindowModal);
+    progress->setMinimumDuration(400);
+    connect(progress, &QProgressDialog::canceled, this, [cancel] { cancel->store(true); });
+    const QPointer<QProgressDialog> dialog(progress);
+    const QPointer<MainWindow> self(this);
+    // Walking the tree and resolving canonical paths (which opens every file on
+    // Windows) runs on a worker, so the window keeps repainting meanwhile.
+    QThreadPool::globalInstance()->start([folder, shownFolder, cancel, self, dialog] {
+        QStringList found;
+        QElapsedTimer sinceReport;
+        sinceReport.start();
+        QDirIterator it(folder, {"*.pat", "*.qli", "*.svg"}, QDir::Files,
+                        QDirIterator::Subdirectories);
+        while (it.hasNext() && !cancel->load()) {
+            const QString canonical = it.nextFileInfo().canonicalFilePath();
+            if (!canonical.isEmpty()) found << canonical;
+            if (sinceReport.elapsed() >= 100 && self) {
+                sinceReport.restart();
+                QMetaObject::invokeMethod(self, [dialog, shownFolder, count = found.size()] {
+                    if (dialog) dialog->setLabelText(
+                        tr("Scanning %1…\n%2 patterns found").arg(shownFolder).arg(count));
+                }, Qt::QueuedConnection);
+            }
+        }
+        if (!self) return;
+        QMetaObject::invokeMethod(self, [self, dialog, shownFolder, found = std::move(found),
+                                         cancelled = cancel->load()] {
+            if (!self) return;
+            self->scanning_ = false;
+            if (dialog) dialog->deleteLater();
+            if (cancelled) {
+                self->statusBar()->showMessage(tr("Adding %1 was cancelled.").arg(shownFolder));
+                return;
+            }
+            const int added = self->addCanonicalPaths(found);
+            self->saveLibrary();
+            self->refreshList();
+            self->statusBar()->showMessage(tr("Added %1 new pattern(s) from %2 (%3 found).")
+                                               .arg(added).arg(shownFolder).arg(found.size()));
+        }, Qt::QueuedConnection);
+    });
 }
 
 void MainWindow::openFile(const QString& path) {
@@ -639,10 +888,13 @@ void MainWindow::openFile(const QString& path) {
 
 void MainWindow::removeSelected() {
     QStringList paths;
-    QListWidget* active = view_mode_ == 0 ? files_ : view_mode_ == 1 ? thumbnails_ : keyword_grid_;
-    for (auto* item : active->selectedItems()) paths << item->data(Qt::UserRole).toString();
+    for (auto* item : activeList()->selectedItems())
+        if (!item->isHidden()) paths << item->data(Qt::UserRole).toString();
     if (paths.isEmpty() && !current_.isEmpty()) paths << current_;
-    for (const auto& path : paths) { library_.removeAll(path); keywords_.remove(path); }
+    const QSet<QString> removing(paths.cbegin(), paths.cend());
+    library_.removeIf([&removing](const QString& path) { return removing.contains(path); });
+    for (const auto& path : paths) keywords_.remove(path);
+    rebuildLibraryKeys();
     saveLibrary(); refreshList();
     statusBar()->showMessage(tr("Removed %1 file(s) from the library; disk files were not deleted.")
                              .arg(paths.size()));
@@ -653,6 +905,7 @@ void MainWindow::purgeMissing() {
     for (auto it = library_.begin(); it != library_.end();)
         if (!QFileInfo::exists(*it)) { keywords_.remove(*it); it = library_.erase(it); ++removed; }
         else ++it;
+    rebuildLibraryKeys();
     saveLibrary(); refreshList();
     statusBar()->showMessage(tr("Purged %1 missing file(s) from the database.").arg(removed));
 }
@@ -662,16 +915,17 @@ void MainWindow::resetDatabase() {
     if (QMessageBox::warning(this, tr("Reset Database"),
         tr("Remove all %1 file entries from the database?\n\nFiles on disk will not be deleted.\nThis cannot be undone.")
         .arg(library_.size()), QMessageBox::Yes | QMessageBox::No, QMessageBox::No) != QMessageBox::Yes) return;
-    library_.clear(); keywords_.clear(); current_.clear();
+    library_.clear(); library_keys_.clear(); keywords_.clear(); current_.clear();
     canvas_->clear(); file_name_->setText("—"); file_path_->setText("—");
     dimensions_->setText("—"); statistics_->clear(); comments_->clear(); keyword_edit_->clear();
     search_->clear(); saveLibrary(); refreshList();
 }
 
 void MainWindow::clearThumbnailCache() {
-    QDir dir(thumbnailCacheDirectory());
+    QDir dir(thumbnail_cache_dir_);
     int count = 0;
     for (const auto& file : dir.entryList(QDir::Files)) if (dir.remove(file)) ++count;
+    thumbnail_failed_.clear();
     populateView();
     statusBar()->showMessage(tr("Thumbnail cache cleared (%1 entries removed).").arg(count));
 }
@@ -698,6 +952,7 @@ void MainWindow::mergeDuplicates() {
         keywords_[keeper] = normalizeKeywords(combined);
         report << "";
     }
+    rebuildLibraryKeys();
     saveLibrary(); refreshList();
     if (!sets) QMessageBox::information(this, tr("Merge Duplicates"), tr("No byte-identical files of the same type were found."));
     else QMessageBox::information(this, tr("Duplicate Files Merged"),
@@ -708,20 +963,31 @@ void MainWindow::mergeDuplicates() {
 void MainWindow::saveCurrentKeywords() {
     if (current_.isEmpty()) return;
     const auto normalized = normalizeKeywords(keyword_edit_->text());
-    keyword_edit_->setText(normalized); keywords_[current_] = normalized;
-    saveLibrary(); refreshList();
+    if (keyword_edit_->text() != normalized) keyword_edit_->setText(normalized);
+    // editingFinished also fires whenever focus merely leaves the field.
+    if (keywords_.value(current_).toString() == normalized) return;
+    keywords_[current_] = normalized;
+    saveLibrary();
+    if (auto* item = itemForPath(current_)) item->setToolTip(itemToolTip(current_));
+    // Only a keyword search can change which rows match.
+    if (search_keywords_->isChecked() && !search_->text().trimmed().isEmpty()) applyFilter();
     statusBar()->showMessage(tr("Keywords saved for '%1'.").arg(QFileInfo(current_).fileName()));
 }
 
 void MainWindow::applyBulkKeywords() {
     const auto add = normalizeKeywords(bulk_keyword_edit_->text());
-    if (add.isEmpty() || keyword_grid_->selectedItems().isEmpty()) return;
-    for (auto* item : keyword_grid_->selectedItems()) {
+    QList<QListWidgetItem*> selected;
+    for (auto* item : keyword_grid_->selectedItems())
+        if (!item->isHidden()) selected << item;
+    if (add.isEmpty() || selected.isEmpty()) return;
+    for (auto* item : selected) {
         const auto path = item->data(Qt::UserRole).toString();
         keywords_[path] = normalizeKeywords(keywords_.value(path).toString() + ", " + add);
+        item->setToolTip(itemToolTip(path));
     }
-    saveLibrary(); refreshList();
-    statusBar()->showMessage(tr("Keywords applied to selected files."));
+    saveLibrary();
+    if (search_keywords_->isChecked() && !search_->text().trimmed().isEmpty()) applyFilter();
+    statusBar()->showMessage(tr("Keywords applied to %1 selected file(s).").arg(selected.size()));
 }
 
 void MainWindow::showKeywordsList() {
@@ -855,9 +1121,7 @@ void MainWindow::showAbout() {
 void MainWindow::openInitialPath(const QString& path) {
     QFileInfo info(path);
     if (info.isDir()) {
-        QDirIterator it(path, {"*.pat", "*.qli", "*.svg"}, QDir::Files, QDirIterator::Subdirectories);
-        while (it.hasNext()) addPath(it.next());
-        saveLibrary(); refreshList();
+        scanFolder(path);
     } else if (info.isFile()) {
         addPath(path); saveLibrary(); refreshList(); openFile(info.canonicalFilePath());
     }
