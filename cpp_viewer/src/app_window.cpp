@@ -22,6 +22,9 @@
 #include <QHBoxLayout>
 #include <QInputDialog>
 #include <QItemSelection>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QLabel>
 #include <QLineEdit>
 #include <QListWidget>
@@ -78,22 +81,26 @@ QString thumbnailCachePath(const QString& cacheDir, const QString& path, const Q
     return cacheDir + '/' + QString::fromLatin1(digest) + ".png";
 }
 
-// Writes via QSaveFile so another worker never reads a half-written PNG.
+// Writes via QSaveFile so a reader never sees a half-written file.
+bool writeFileAtomically(const QString& path, const QByteArray& data) {
+    // On Windows the rename in commit() fails now and then with a sharing
+    // violation while antivirus or the indexer briefly opens the new file.
+    for (int attempt = 0; attempt < 5; ++attempt) {
+        if (attempt) QThread::msleep(10u << attempt);
+        QSaveFile file(path);
+        if (file.open(QIODevice::WriteOnly) && file.write(data) == data.size() && file.commit())
+            return true;
+    }
+    return false;
+}
+
 void saveThumbnail(const QImage& image, const QString& cachePath) {
     QByteArray png;
     QBuffer buffer(&png);
     buffer.open(QIODevice::WriteOnly);
     // Quality 80 selects a faster PNG compression level while remaining
     // lossless. It is also smaller than Qt's default for these line images.
-    if (!image.save(&buffer, "PNG", 80)) return;
-    // On Windows the rename in commit() fails now and then with a sharing
-    // violation while antivirus or the indexer briefly opens the new file.
-    for (int attempt = 0; attempt < 5; ++attempt) {
-        if (attempt) QThread::msleep(10u << attempt);
-        QSaveFile file(cachePath);
-        if (file.open(QIODevice::WriteOnly) && file.write(png) == png.size() && file.commit())
-            return;
-    }
+    if (image.save(&buffer, "PNG", 80)) writeFileAtomically(cachePath, png);
 }
 
 template <typename Result>
@@ -180,6 +187,33 @@ QString fileDigest(const QString& path) {
 
 } // namespace
 
+// Handed to the work function of MainWindow::runInBackground on its worker thread.
+class BackgroundJob {
+public:
+    BackgroundJob(std::shared_ptr<std::atomic<bool>> cancel, QPointer<MainWindow> window,
+                  QPointer<QProgressDialog> dialog)
+        : cancel_(std::move(cancel)), window_(window), dialog_(dialog) {
+        since_report_.start();
+    }
+    [[nodiscard]] bool cancelled() const { return cancel_->load(); }
+    // Updates the progress dialog at most every 100 ms; total 0 shows a busy bar.
+    void progress(int done, int total, const QString& label) {
+        if (since_report_.elapsed() < 100 || !window_) return;
+        since_report_.restart();
+        QMetaObject::invokeMethod(window_, [dialog = dialog_, done, total, label] {
+            if (!dialog || dialog->wasCanceled()) return;
+            dialog->setMaximum(total);
+            dialog->setValue(done);
+            dialog->setLabelText(label);
+        }, Qt::QueuedConnection);
+    }
+private:
+    std::shared_ptr<std::atomic<bool>> cancel_;
+    QPointer<MainWindow> window_;
+    QPointer<QProgressDialog> dialog_;
+    QElapsedTimer since_report_;
+};
+
 MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     thumbnail_pool_ = new QThreadPool(this);
     const int idealThreads = std::max(4, QThread::idealThreadCount());
@@ -196,6 +230,12 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     background_thumbnail_timer_ = new QTimer(this);
     background_thumbnail_timer_->setSingleShot(true);
     background_thumbnail_timer_->setInterval(background_thumbnail_delay_ms);
+    // Edits come in bursts (typing keywords, bulk changes), so the library file
+    // is written once things go quiet rather than after every change.
+    save_timer_ = new QTimer(this);
+    save_timer_->setSingleShot(true);
+    save_timer_->setInterval(1000);
+    connect(save_timer_, &QTimer::timeout, this, &MainWindow::flushLibrary);
     thumbnail_cache_dir_ = thumbnailCacheDirectory();
     QDir().mkpath(thumbnail_cache_dir_);
     QPixmap blank(thumbnail_size, thumbnail_size);
@@ -210,7 +250,8 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
 }
 
 MainWindow::~MainWindow() {
-    if (scan_cancel_) scan_cancel_->store(true);
+    if (job_cancel_) job_cancel_->store(true);
+    flushLibrary();
     invalidateThumbnails();
     thumbnail_pool_->waitForDone();
 }
@@ -442,20 +483,115 @@ void MainWindow::buildMenus() {
     action(help, tr("&About"), {}, [this] { showAbout(); });
 }
 
-void MainWindow::loadLibrary() {
-    QSettings settings("OpenAI", "QuiltPatternViewer");
-    library_ = settings.value("library").toStringList();
-    rebuildLibraryKeys();
-    keywords_ = settings.value("keywords").toMap();
-    line_color_ = QColor(settings.value("lineColor", "#000000").toString());
-    canvas_->setLineColor(line_color_);
+QString MainWindow::libraryFilePath() {
+    return QStandardPaths::writableLocation(QStandardPaths::AppDataLocation) + "/library.json";
 }
 
-void MainWindow::saveLibrary() const {
+// The library and keywords live in a JSON file rather than QSettings, which on
+// Windows is the registry: rewriting thousands of paths there on every keyword
+// edit was slow, and Microsoft advises against large registry values.
+void MainWindow::loadLibrary() {
     QSettings settings("OpenAI", "QuiltPatternViewer");
-    settings.setValue("library", library_);
-    settings.setValue("keywords", keywords_);
+    line_color_ = QColor(settings.value("lineColor", "#000000").toString());
+    canvas_->setLineColor(line_color_);
+
+    bool migrated = false;
+    QFile file(libraryFilePath());
+    if (file.open(QIODevice::ReadOnly)) {
+        QJsonParseError error{};
+        const auto document = QJsonDocument::fromJson(file.readAll(), &error);
+        if (document.isObject()) {
+            const auto root = document.object();
+            for (const auto& value : root.value("library").toArray())
+                library_ << value.toString();
+            keywords_ = root.value("keywords").toObject().toVariantMap();
+        } else {
+            // Keep the unreadable file for inspection; the next save replaces it.
+            const QString kept = libraryFilePath() + ".unreadable";
+            QFile::remove(kept);
+            QFile::copy(libraryFilePath(), kept);
+            statusBar()->showMessage(
+                tr("The pattern library could not be read (%1). A copy was kept as %2.")
+                    .arg(error.errorString(), QDir::toNativeSeparators(kept)));
+        }
+    } else if (settings.contains("library") || settings.contains("keywords")) {
+        // Earlier versions kept the library in QSettings.
+        library_ = settings.value("library").toStringList();
+        keywords_ = settings.value("keywords").toMap();
+        migrated = true;
+    }
+    rebuildLibraryKeys();
+    if (migrated) {
+        library_dirty_ = true;
+        if (flushLibrary()) {
+            settings.remove("library");
+            settings.remove("keywords");
+        }
+    }
+}
+
+void MainWindow::saveLibrary() {
+    library_dirty_ = true;
+    save_timer_->start();
+}
+
+bool MainWindow::flushLibrary() {
+    save_timer_->stop();
+    if (!library_dirty_) return true;
+    QSettings settings("OpenAI", "QuiltPatternViewer");
     settings.setValue("lineColor", line_color_.name());
+    QJsonObject root;
+    root["version"] = 1;
+    root["library"] = QJsonArray::fromStringList(library_);
+    root["keywords"] = QJsonObject::fromVariantMap(keywords_);
+    const QString path = libraryFilePath();
+    QDir().mkpath(QFileInfo(path).absolutePath());
+    if (!writeFileAtomically(path, QJsonDocument(root).toJson())) {
+        // Stays dirty, so the next change or closing the window tries again.
+        statusBar()->showMessage(
+            tr("Could not save the pattern library to %1.").arg(QDir::toNativeSeparators(path)));
+        return false;
+    }
+    library_dirty_ = false;
+    return true;
+}
+
+void MainWindow::runInBackground(const QString& title, const QString& label,
+                                 std::function<void(BackgroundJob&)> work,
+                                 std::function<void(bool cancelled)> finish) {
+    if (job_running_) {
+        statusBar()->showMessage(tr("Please wait for the current task to finish."));
+        return;
+    }
+    job_running_ = true;
+    auto cancel = std::make_shared<std::atomic<bool>>(false);
+    job_cancel_ = cancel;
+    auto* progress = new QProgressDialog(label, tr("Cancel"), 0, 0, this);
+    progress->setWindowTitle(title);
+    progress->setWindowModality(Qt::WindowModal);
+    progress->setMinimumDuration(400);
+    progress->setAutoReset(false);
+    progress->setAutoClose(false);
+    const QPointer<QProgressDialog> dialog(progress);
+    connect(progress, &QProgressDialog::canceled, this, [cancel, dialog] {
+        cancel->store(true);
+        if (dialog) dialog->setLabelText(tr("Cancelling…"));
+    });
+    const QPointer<MainWindow> self(this);
+    // `work` runs on a worker thread and must not touch the window; `finish`
+    // runs on the GUI thread once it returns.
+    QThreadPool::globalInstance()->start(
+        [work = std::move(work), finish = std::move(finish), cancel, self, dialog] {
+            BackgroundJob job(cancel, self, dialog);
+            work(job);
+            if (!self) return;
+            QMetaObject::invokeMethod(self, [self, dialog, finish, cancel] {
+                if (!self) return;
+                self->job_running_ = false;
+                if (dialog) dialog->deleteLater();
+                finish(cancel->load());
+            }, Qt::QueuedConnection);
+        });
 }
 
 QString MainWindow::normalizeKeywords(const QString& value) {
@@ -806,58 +942,32 @@ void MainWindow::addFolder() {
 }
 
 void MainWindow::scanFolder(const QString& folder) {
-    if (scanning_) {
-        statusBar()->showMessage(tr("A folder is already being added."));
-        return;
-    }
-    scanning_ = true;
-    auto cancel = std::make_shared<std::atomic<bool>>(false);
-    scan_cancel_ = cancel;
     const QString shownFolder = QDir::toNativeSeparators(folder);
-    auto* progress = new QProgressDialog(tr("Scanning %1…").arg(shownFolder), tr("Cancel"),
-                                         0, 0, this);
-    progress->setWindowTitle(tr("Add Folder"));
-    progress->setWindowModality(Qt::WindowModal);
-    progress->setMinimumDuration(400);
-    connect(progress, &QProgressDialog::canceled, this, [cancel] { cancel->store(true); });
-    const QPointer<QProgressDialog> dialog(progress);
-    const QPointer<MainWindow> self(this);
+    auto found = std::make_shared<QStringList>();
     // Walking the tree and resolving canonical paths (which opens every file on
     // Windows) runs on a worker, so the window keeps repainting meanwhile.
-    QThreadPool::globalInstance()->start([folder, shownFolder, cancel, self, dialog] {
-        QStringList found;
-        QElapsedTimer sinceReport;
-        sinceReport.start();
-        QDirIterator it(folder, {"*.pat", "*.qli", "*.svg"}, QDir::Files,
-                        QDirIterator::Subdirectories);
-        while (it.hasNext() && !cancel->load()) {
-            const QString canonical = it.nextFileInfo().canonicalFilePath();
-            if (!canonical.isEmpty()) found << canonical;
-            if (sinceReport.elapsed() >= 100 && self) {
-                sinceReport.restart();
-                QMetaObject::invokeMethod(self, [dialog, shownFolder, count = found.size()] {
-                    if (dialog) dialog->setLabelText(
-                        tr("Scanning %1…\n%2 patterns found").arg(shownFolder).arg(count));
-                }, Qt::QueuedConnection);
+    runInBackground(tr("Add Folder"), tr("Scanning %1…").arg(shownFolder),
+        [folder, shownFolder, found](BackgroundJob& job) {
+            QDirIterator it(folder, {"*.pat", "*.qli", "*.svg"}, QDir::Files,
+                            QDirIterator::Subdirectories);
+            while (it.hasNext() && !job.cancelled()) {
+                const QString canonical = it.nextFileInfo().canonicalFilePath();
+                if (!canonical.isEmpty()) *found << canonical;
+                job.progress(0, 0, tr("Scanning %1…\n%2 patterns found")
+                                       .arg(shownFolder).arg(found->size()));
             }
-        }
-        if (!self) return;
-        QMetaObject::invokeMethod(self, [self, dialog, shownFolder, found = std::move(found),
-                                         cancelled = cancel->load()] {
-            if (!self) return;
-            self->scanning_ = false;
-            if (dialog) dialog->deleteLater();
+        },
+        [this, shownFolder, found](bool cancelled) {
             if (cancelled) {
-                self->statusBar()->showMessage(tr("Adding %1 was cancelled.").arg(shownFolder));
+                statusBar()->showMessage(tr("Adding %1 was cancelled.").arg(shownFolder));
                 return;
             }
-            const int added = self->addCanonicalPaths(found);
-            self->saveLibrary();
-            self->refreshList();
-            self->statusBar()->showMessage(tr("Added %1 new pattern(s) from %2 (%3 found).")
-                                               .arg(added).arg(shownFolder).arg(found.size()));
-        }, Qt::QueuedConnection);
-    });
+            const int added = addCanonicalPaths(*found);
+            saveLibrary();
+            refreshList();
+            statusBar()->showMessage(tr("Added %1 new pattern(s) from %2 (%3 found).")
+                                         .arg(added).arg(shownFolder).arg(found->size()));
+        });
 }
 
 void MainWindow::openFile(const QString& path) {
@@ -931,33 +1041,74 @@ void MainWindow::clearThumbnailCache() {
 }
 
 void MainWindow::mergeDuplicates() {
-    QHash<QString, QStringList> groups;
-    for (const auto& path : library_) {
-        const auto digest = fileDigest(path);
-        if (!digest.isEmpty()) groups[QFileInfo(path).suffix().toLower() + ':' + digest] << path;
-    }
-    int sets = 0, removed = 0;
-    QStringList report;
-    for (auto paths : groups) {
-        if (paths.size() < 2) continue;
-        paths.sort(Qt::CaseInsensitive); ++sets;
-        const auto keeper = paths.first();
-        report << tr("KEPT: %1").arg(keeper);
-        QString combined = keywords_.value(keeper).toString();
-        for (int i = 1; i < paths.size(); ++i) {
-            combined += ", " + keywords_.value(paths[i]).toString();
-            library_.removeAll(paths[i]); keywords_.remove(paths[i]); ++removed;
-            report << tr("REMOVED: %1").arg(paths[i]);
-        }
-        keywords_[keeper] = normalizeKeywords(combined);
-        report << "";
-    }
-    rebuildLibraryKeys();
-    saveLibrary(); refreshList();
-    if (!sets) QMessageBox::information(this, tr("Merge Duplicates"), tr("No byte-identical files of the same type were found."));
-    else QMessageBox::information(this, tr("Duplicate Files Merged"),
-        tr("Merged %1 duplicate set(s); %2 library entries removed.\n\n%3")
-        .arg(sets).arg(removed).arg(report.join('\n')));
+    auto groups = std::make_shared<QList<QStringList>>();
+    // Hashing runs on a worker. Only files of the same type and size can be
+    // identical, so most files are never read at all.
+    runInBackground(tr("Merge Duplicates"), tr("Looking for identical files…"),
+        [library = library_, groups](BackgroundJob& job) {
+            QHash<QString, QStringList> bySize;
+            for (int i = 0; i < library.size() && !job.cancelled(); ++i) {
+                const QFileInfo info(library[i]);
+                if (info.isFile())
+                    bySize[info.suffix().toLower() + ':' + QString::number(info.size())] << library[i];
+                job.progress(i, library.size(),
+                             tr("Checking file sizes… %1 of %2").arg(i + 1).arg(library.size()));
+            }
+            QStringList candidates;
+            for (const auto& sameSize : std::as_const(bySize))
+                if (sameSize.size() > 1) candidates << sameSize;
+            QHash<QString, QStringList> byContent;
+            for (int i = 0; i < candidates.size() && !job.cancelled(); ++i) {
+                const QString& path = candidates[i];
+                const auto digest = fileDigest(path);
+                if (!digest.isEmpty())
+                    byContent[QFileInfo(path).suffix().toLower() + ':' + digest] << path;
+                job.progress(i, candidates.size(), tr("Comparing %1 of %2 files of matching size…")
+                                                       .arg(i + 1).arg(candidates.size()));
+            }
+            for (const auto& same : std::as_const(byContent))
+                if (same.size() > 1) *groups << same;
+        },
+        [this, groups](bool cancelled) {
+            if (cancelled) {
+                statusBar()->showMessage(tr("Merge Duplicates was cancelled; nothing changed."));
+                return;
+            }
+            int removed = 0;
+            QStringList report;
+            QSet<QString> removing;
+            for (auto paths : std::as_const(*groups)) {
+                paths.sort(Qt::CaseInsensitive);
+                const auto keeper = paths.first();
+                report << tr("KEPT: %1").arg(keeper);
+                QString combined = keywords_.value(keeper).toString();
+                for (int i = 1; i < paths.size(); ++i) {
+                    combined += ", " + keywords_.value(paths[i]).toString();
+                    removing.insert(paths[i]);
+                    keywords_.remove(paths[i]);
+                    ++removed;
+                    report << tr("REMOVED: %1").arg(paths[i]);
+                }
+                keywords_[keeper] = normalizeKeywords(combined);
+                report << "";
+            }
+            library_.removeIf([&removing](const QString& path) { return removing.contains(path); });
+            rebuildLibraryKeys();
+            saveLibrary(); refreshList();
+            if (groups->isEmpty()) {
+                QMessageBox::information(this, tr("Merge Duplicates"),
+                                         tr("No byte-identical files of the same type were found."));
+                return;
+            }
+            // Keep the message box a sensible size for large libraries.
+            constexpr int max_report_lines = 40;
+            QString details = report.mid(0, max_report_lines).join('\n');
+            if (report.size() > max_report_lines)
+                details += tr("\n… and %1 more lines").arg(report.size() - max_report_lines);
+            QMessageBox::information(this, tr("Duplicate Files Merged"),
+                tr("Merged %1 duplicate set(s); %2 library entries removed.\n\n%3")
+                    .arg(groups->size()).arg(removed).arg(details));
+        });
 }
 
 void MainWindow::saveCurrentKeywords() {
@@ -1028,18 +1179,26 @@ void MainWindow::convertCurrent(const QString& extension) {
 void MainWindow::convertSourceDialog(const QString& sourceExt, const QString& outputExt) {
     const auto sources = QFileDialog::getOpenFileNames(this, tr("Select file(s) to convert"), {},
         sourceExt == ".svg" ? tr("SVG Files (*.svg)") : tr("QLI Files (*.qli)"));
-    for (const auto& source : sources) {
-        auto output = source; output.chop(sourceExt.size()); output += outputExt;
-        if (sources.size() == 1) {
-            output = QFileDialog::getSaveFileName(this, tr("Save converted file"), output,
-                outputExt == ".pat" ? tr("Innova PAT (*.pat)") : tr("Statler QLI (*.qli)"));
-            if (output.isEmpty()) return;
-        } else if (QFileInfo::exists(output) && QMessageBox::question(this, tr("Overwrite"),
-                   tr("%1 exists. Overwrite?").arg(output)) != QMessageBox::Yes) continue;
-        try { convert_file(source.toStdString(), output.toStdString()); addPath(output); }
+    if (sources.isEmpty()) return;
+    if (sources.size() == 1) {
+        auto output = sources.first();
+        output.chop(sourceExt.size());
+        output += outputExt;
+        output = QFileDialog::getSaveFileName(this, tr("Save converted file"), output,
+            outputExt == ".pat" ? tr("Innova PAT (*.pat)") : tr("Statler QLI (*.qli)"));
+        if (output.isEmpty()) return;
+        try { convert_file(sources.first().toStdString(), output.toStdString()); addPath(output); }
         catch (const std::exception& e) { QMessageBox::warning(this, tr("Conversion failed"), e.what()); }
+        saveLibrary(); refreshList();
+        return;
     }
-    saveLibrary(); refreshList();
+    QList<QPair<QString, QString>> files;
+    for (const auto& source : sources) {
+        auto output = source;
+        output.chop(sourceExt.size());
+        files.append({source, output + outputExt});
+    }
+    convertFiles(files);
 }
 
 void MainWindow::convertFolder(bool recursive) {
@@ -1051,20 +1210,98 @@ void MainWindow::convertFolder(bool recursive) {
     if (folder.isEmpty()) return;
     const QString sourceExt = mode.startsWith("QLI") ? ".qli" : ".svg";
     const QString outputExt = mode.endsWith("QLI") ? ".qli" : ".pat";
-    int converted = 0, skipped = 0, failed = 0;
-    QDirIterator it(folder, {"*" + sourceExt}, QDir::Files,
-                    recursive ? QDirIterator::Subdirectories : QDirIterator::NoIteratorFlags);
-    while (it.hasNext()) {
-        const auto source = it.next();
-        auto output = source; output.chop(sourceExt.size()); output += outputExt;
-        if (QFileInfo::exists(output) && QMessageBox::question(this, tr("Overwrite"),
-            tr("%1 exists. Overwrite?").arg(output)) != QMessageBox::Yes) { ++skipped; continue; }
-        try { convert_file(source.toStdString(), output.toStdString()); addPath(output); ++converted; }
-        catch (...) { ++failed; }
+    auto files = std::make_shared<QList<QPair<QString, QString>>>();
+    auto existing = std::make_shared<int>(0);
+    runInBackground(tr("Convert Folder"), tr("Looking for %1 files…").arg(sourceExt),
+        [folder, sourceExt, outputExt, recursive, files, existing](BackgroundJob& job) {
+            QDirIterator it(folder, {"*" + sourceExt}, QDir::Files,
+                            recursive ? QDirIterator::Subdirectories : QDirIterator::NoIteratorFlags);
+            while (it.hasNext() && !job.cancelled()) {
+                const QString source = it.next();
+                QString output = source;
+                output.chop(sourceExt.size());
+                output += outputExt;
+                if (QFileInfo::exists(output)) ++*existing;
+                files->append({source, output});
+                job.progress(0, 0, tr("Looking for %1 files… %2 found")
+                                       .arg(sourceExt).arg(files->size()));
+            }
+        },
+        [this, files, existing, sourceExt](bool cancelled) {
+            if (cancelled) {
+                statusBar()->showMessage(tr("Folder conversion was cancelled."));
+                return;
+            }
+            if (files->isEmpty()) {
+                QMessageBox::information(this, tr("Folder Conversion"),
+                                         tr("No %1 files were found.").arg(sourceExt));
+                return;
+            }
+            convertFiles(*files, *existing);
+        });
+}
+
+void MainWindow::convertFiles(const QList<QPair<QString, QString>>& files, int existing) {
+    if (existing < 0) {
+        existing = 0;
+        for (const auto& file : files) existing += QFileInfo::exists(file.second) ? 1 : 0;
     }
-    saveLibrary(); refreshList();
-    QMessageBox::information(this, tr("Folder Conversion"),
-        tr("Converted: %1\nSkipped: %2\nFailed: %3").arg(converted).arg(skipped).arg(failed));
+    // One question for the whole batch instead of one per existing file.
+    bool overwrite = false;
+    if (existing > 0) {
+        QMessageBox box(QMessageBox::Question, tr("Convert"),
+                        tr("%1 of the %2 output files already exist.").arg(existing).arg(files.size()),
+                        QMessageBox::NoButton, this);
+        auto* overwriteButton = box.addButton(tr("Overwrite"), QMessageBox::AcceptRole);
+        auto* skipButton = box.addButton(tr("Skip Existing"), QMessageBox::AcceptRole);
+        box.addButton(QMessageBox::Cancel);
+        box.setDefaultButton(skipButton);
+        box.exec();
+        if (box.clickedButton() != overwriteButton && box.clickedButton() != skipButton) return;
+        overwrite = box.clickedButton() == overwriteButton;
+    }
+    struct Outcome {
+        QStringList converted;
+        int skipped = 0;
+        QStringList failures;
+    };
+    auto outcome = std::make_shared<Outcome>();
+    runInBackground(tr("Convert"), tr("Converting…"),
+        [files, overwrite, outcome](BackgroundJob& job) {
+            for (int i = 0; i < files.size() && !job.cancelled(); ++i) {
+                const auto& [source, output] = files[i];
+                job.progress(i, files.size(), tr("Converting %1 of %2\n%3")
+                    .arg(i + 1).arg(files.size()).arg(QFileInfo(source).fileName()));
+                if (!overwrite && QFileInfo::exists(output)) {
+                    ++outcome->skipped;
+                    continue;
+                }
+                try {
+                    convert_file(source.toStdString(), output.toStdString());
+                    outcome->converted << QFileInfo(output).canonicalFilePath();
+                } catch (const std::exception& e) {
+                    outcome->failures << QString("%1: %2").arg(QDir::toNativeSeparators(source),
+                                                               QString::fromUtf8(e.what()));
+                }
+            }
+        },
+        [this, total = files.size(), outcome](bool cancelled) {
+            // Files converted before a cancel exist on disk, so they are kept.
+            addCanonicalPaths(outcome->converted);
+            saveLibrary(); refreshList();
+            const auto done = outcome->converted.size() + outcome->skipped + outcome->failures.size();
+            QString text = tr("Converted: %1\nSkipped: %2\nFailed: %3")
+                               .arg(outcome->converted.size()).arg(outcome->skipped)
+                               .arg(outcome->failures.size());
+            if (cancelled) text.prepend(tr("Cancelled after %1 of %2 files.\n\n").arg(done).arg(total));
+            constexpr int max_failures_shown = 10;
+            if (!outcome->failures.isEmpty()) {
+                text += "\n\n" + outcome->failures.mid(0, max_failures_shown).join('\n');
+                if (outcome->failures.size() > max_failures_shown)
+                    text += tr("\n… and %1 more").arg(outcome->failures.size() - max_failures_shown);
+            }
+            QMessageBox::information(this, tr("Conversion"), text);
+        });
 }
 
 void MainWindow::chooseLineColor() {

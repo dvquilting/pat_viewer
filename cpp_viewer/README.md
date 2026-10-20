@@ -20,6 +20,16 @@ It has:
   in-app Help/About menu matching the Python application;
 - a command-line converter that builds even when Qt is unavailable.
 
+## Where the viewer keeps its data
+
+- The pattern library and keywords are in `library.json` in the app data
+  folder (on Windows, `%APPDATA%\OpenAI\Quilt Pattern Viewer`). Earlier
+  versions kept them in QSettings (the registry on Windows); they are moved to
+  `library.json` the first time a newer version starts.
+- The line colour is still a QSettings value.
+- Thumbnails are cached as PNG files in the cache folder (on Windows,
+  `%LOCALAPPDATA%\OpenAI\Quilt Pattern Viewer\cache\thumbnails`).
+
 ## Build
 
 Windows (Visual Studio 2022):

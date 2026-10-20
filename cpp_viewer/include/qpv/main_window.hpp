@@ -12,6 +12,7 @@
 #include <QVariantMap>
 
 #include <atomic>
+#include <functional>
 #include <memory>
 #include <vector>
 
@@ -29,6 +30,7 @@ class QResizeEvent;
 
 namespace qpv {
 
+class BackgroundJob;
 class PatternCanvas;
 
 class MainWindow final : public QMainWindow {
@@ -71,8 +73,11 @@ private:
     std::vector<int> shown_rows_;      // rows that match the search, in order
     std::vector<int> shown_position_;  // row -> index into shown_rows_, or -1
     QString current_;
-    std::shared_ptr<std::atomic<bool>> scan_cancel_;
-    bool scanning_{};
+    // The one background job allowed at a time (see runInBackground).
+    std::shared_ptr<std::atomic<bool>> job_cancel_;
+    bool job_running_{};
+    QTimer* save_timer_{};
+    bool library_dirty_{};
     int view_mode_{};
     QColor line_color_{Qt::black};
     QThreadPool* thumbnail_pool_{};
@@ -99,7 +104,12 @@ private:
     void buildUi();
     void buildMenus();
     void loadLibrary();
-    void saveLibrary() const;
+    void saveLibrary();
+    bool flushLibrary();
+    [[nodiscard]] static QString libraryFilePath();
+    void runInBackground(const QString& title, const QString& label,
+                         std::function<void(BackgroundJob&)> work,
+                         std::function<void(bool cancelled)> finish);
     void rebuildLibraryKeys();
     int addCanonicalPaths(const QStringList& paths);
     void refreshList();
@@ -133,6 +143,8 @@ private:
     void convertCurrent(const QString& extension);
     void convertSourceDialog(const QString& sourceExtension, const QString& outputExtension);
     void convertFolder(bool recursive);
+    // `existing` is how many outputs already exist, or -1 to check here.
+    void convertFiles(const QList<QPair<QString, QString>>& sourcesAndOutputs, int existing = -1);
     void chooseLineColor();
     void showHelp();
     void showAbout();

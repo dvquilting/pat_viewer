@@ -6,12 +6,16 @@
 #include <QElapsedTimer>
 #include <QFile>
 #include <QFileInfo>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QSettings>
 #include <QStandardPaths>
 #include <QTemporaryDir>
 #include <QThread>
 
 #include <iostream>
+#include <memory>
 #include <stdexcept>
 
 namespace {
@@ -85,6 +89,31 @@ int main(int argc, char** argv) {
         QDir cache(cacheRoot);
         check(!cache.exists() || cache.removeRecursively(),
               "Could not clear the isolated thumbnail test cache");
+        const QString dataRoot =
+            QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
+        QDir data(dataRoot);
+        check(!data.exists() || data.removeRecursively(), "Could not clear the test data folder");
+        const QString libraryFile = dataRoot + "/library.json";
+        auto readLibrary = [&libraryFile] {
+            QFile file(libraryFile);
+            check(file.open(QIODevice::ReadOnly), "library.json was not written");
+            return QJsonDocument::fromJson(file.readAll()).object();
+        };
+
+        // A library kept in QSettings by earlier versions moves to library.json.
+        std::cerr << "Migrating a QSettings library\n";
+        settings.setValue("library", QStringList{"C:/x/a.pat", "C:/x/b.pat", "C:/X/A.pat"});
+        settings.setValue("keywords", QVariantMap{{"C:/x/a.pat", "feather"}});
+        settings.sync();
+        { qpv::MainWindow migrating; }
+        settings.sync();
+        const QJsonObject migrated = readLibrary();
+        check(migrated.value("library").toArray().size() == 2, "Migrated library entries");
+        check(migrated.value("keywords").toObject().value("C:/x/a.pat").toString() == "feather",
+              "Migrated keywords");
+        check(!settings.contains("library") && !settings.contains("keywords"),
+              "Library left in QSettings after migration");
+        check(QFile::remove(libraryFile), "Could not reset library.json");
 
         QTemporaryDir patterns;
         check(patterns.isValid(), "Could not create temporary pattern directory");
@@ -102,7 +131,8 @@ int main(int argc, char** argv) {
             check(file.write(pattern) == pattern.size(), "Could not write test PAT file");
         }
 
-        qpv::MainWindow window;
+        auto owned = std::make_unique<qpv::MainWindow>();
+        qpv::MainWindow& window = *owned;
         std::cerr << "Opening 110-pattern library\n";
         window.show();
         app.processEvents();
@@ -146,6 +176,9 @@ int main(int argc, char** argv) {
         std::cout << "Generated " << generated
                   << " thumbnails in " << elapsed.elapsed() << " ms\n";
         window.close();
+        owned.reset();  // closing the window saves the library
+        check(readLibrary().value("library").toArray().size() == 110,
+              "library.json does not hold the 110-pattern library");
         return 0;
     } catch (const std::exception& e) {
         std::cerr << "Thumbnail test failure: " << e.what() << '\n';
