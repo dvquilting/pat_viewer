@@ -32,6 +32,7 @@ target_compile_features(qpv_license_key PUBLIC cxx_std_20)
 target_compile_options(qpv_license_key PRIVATE $<$<COMPILE_LANGUAGE:CXX>:${qpv_warnings}>)
 
 add_library(qpv_core
+    src/parse_double.cpp
     src/pattern_io.cpp
     src/qli.cpp
     src/svg.cpp

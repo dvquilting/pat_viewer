@@ -1,13 +1,17 @@
 #include "qpv/io.hpp"
+#include "qpv/parse_double.hpp"
 
 #include <algorithm>
+#include <charconv>
 #include <clocale>
 #include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 
 namespace fs = std::filesystem;
 
@@ -21,6 +25,58 @@ void close(double actual, double expected, double tolerance, const char* message
 void write(const fs::path& path, const std::string& text) {
     std::ofstream out(path, std::ios::binary);
     out << text;
+}
+
+using NumberParser = std::from_chars_result (*)(const char*, const char*, double&);
+
+// `used` is the number of characters of `text` read: 0 when it is not a number.
+void check_number(NumberParser parse, std::string_view text, std::size_t used,
+                  double expected, std::errc ec = std::errc{}) {
+    const double unset = -12345.0;
+    double value = unset;
+    const auto result = parse(text.data(), text.data() + text.size(), value);
+    const std::string label = "Number \"" + std::string(text) + "\": ";
+    if (result.ec != ec) throw std::runtime_error(label + "error");
+    if (result.ptr != text.data() + used) throw std::runtime_error(label + "length");
+    if (ec == std::errc::invalid_argument && value != unset)
+        throw std::runtime_error(label + "value changed");
+    if (ec != std::errc{}) return;
+    const bool same = std::isnan(expected)
+                          ? std::isnan(value)
+                          : value == expected && std::signbit(value) == std::signbit(expected);
+    if (!same) throw std::runtime_error(label + "value");
+}
+
+// The std::from_chars general format; `plus` when a leading '+' is accepted.
+void check_numbers(NumberParser parse, bool plus) {
+    const double inf = std::numeric_limits<double>::infinity();
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    check_number(parse, "1.5", 3, 1.5);
+    check_number(parse, "-.25", 4, -0.25);
+    check_number(parse, ".5e3x", 4, 500.0);
+    check_number(parse, "7e", 1, 7.0);
+    check_number(parse, "7e+", 1, 7.0);
+    check_number(parse, "7E-2,", 4, 0.07);
+    check_number(parse, "1.", 2, 1.0);
+    check_number(parse, "12abc", 2, 12.0);
+    check_number(parse, "0x10", 1, 0.0);
+    check_number(parse, "-0", 2, -0.0);
+    check_number(parse, "0.1", 3, 0.1);
+    check_number(parse, "1234567.890123456789", 20, 1234567.890123456789);
+    check_number(parse, "2.2250738585072014e-308", 23, 2.2250738585072014e-308);
+    check_number(parse, "inf", 3, inf);
+    check_number(parse, "-Infinity", 9, -inf);
+    check_number(parse, "infinit", 3, inf);
+    check_number(parse, "nan", 3, nan);
+    check_number(parse, "NaN(1_a)z", 8, nan);
+    check_number(parse, "nan(", 3, nan);
+    check_number(parse, "1e400", 5, 0.0, std::errc::result_out_of_range);
+    for (const char* bad : {"", ".", "-", "+", "e5", " 1", "-.e1", "+-1", "++1"})
+        check_number(parse, bad, 0, 0.0, std::errc::invalid_argument);
+    if (plus)
+        check_number(parse, "+1.5", 4, 1.5);
+    else
+        check_number(parse, "+1.5", 0, 0.0, std::errc::invalid_argument);
 }
 } // namespace
 
@@ -266,6 +322,9 @@ int main() {
             "<rect width=\"10\" height=\"10\" stroke=\"black\" fill=\"none\"/>");
         check(stitches(square) == 4, "SVG design that is only a square kept");
 
+        check_numbers(qpv::parse_double, true);
+        check_numbers(qpv::detail::parse_double_fallback, false);
+
         // Number parsing must not depend on the C locale's decimal separator.
         bool comma_locale = false;
         for (const char* name : {"de-DE", "German_Germany.1252", "de_DE.UTF-8", "de_DE"}) {
@@ -283,6 +342,8 @@ int main() {
                                "<path d=\"M0 0 L10.5 0\" stroke=\"black\"/></svg>");
             close(qpv::pattern_bounds(qpv::read_svg(decimal_svg)).width(), 10.5, 1e-6,
                   "SVG locale");
+            check_numbers(qpv::parse_double, true);
+            check_numbers(qpv::detail::parse_double_fallback, false);
             std::setlocale(LC_ALL, "C");
         } else {
             std::cout << "Skipped locale test: no comma-decimal locale available\n";

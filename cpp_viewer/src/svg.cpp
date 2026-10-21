@@ -1,4 +1,5 @@
 #include "qpv/io.hpp"
+#include "qpv/parse_double.hpp"
 
 #include <algorithm>
 #include <array>
@@ -59,12 +60,6 @@ std::string_view trim(std::string_view value) {
     while (!value.empty() && is_space(value.front())) value.remove_prefix(1);
     while (!value.empty() && is_space(value.back())) value.remove_suffix(1);
     return value;
-}
-
-// Locale-independent replacement for strtod that also accepts a leading '+'.
-std::from_chars_result parse_double(const char* begin, const char* end, double& value) {
-    if (begin != end && *begin == '+' && (end - begin < 2 || begin[1] != '-')) ++begin;
-    return std::from_chars(begin, end, value);
 }
 
 // A start or end tag. `name` has any namespace prefix removed ("svg:path" is
