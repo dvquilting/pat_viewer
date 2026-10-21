@@ -27,6 +27,9 @@ It has:
 - The line colour is a QSettings value under `dvquilting/QuiltPatternViewer`.
 - Thumbnails are cached as PNG files in the cache folder (on Windows,
   `%LOCALAPPDATA%\dvquilting\Quilt Pattern Viewer\cache\thumbnails`).
+- In builds with licensing on, the trial start and any license key are in
+  `license.dat` (on Windows, `%APPDATA%\dvquilting\QuiltPatternViewer`),
+  shared by the viewer and `qpv-cli`.
 - Earlier versions used the organisation name "OpenAI" for all of these, and
   before that kept the library in QSettings (the registry on Windows). That
   data is moved to the locations above the first time a newer version starts.
@@ -76,10 +79,73 @@ qpv-cli convert design.svg design.qli
 qpv-cli batch qli-to-pat folder [--recursive] [--overwrite]
 qpv-cli batch svg-to-pat folder [--recursive] [--overwrite]
 qpv-cli batch svg-to-qli folder [--recursive] [--overwrite]
+qpv-cli license [install "<name or email>" <key> | remove]   (licensed builds)
 ```
 
 The output format is selected from the destination extension. PAT and QLI are
 written with CRLF line endings for machine-software compatibility.
+
+## Licensing
+
+Licensing is off by default, and then nothing below applies. When it is on:
+
+- each Windows user gets a 30-day trial from the first run of either program;
+- after the trial, opening and viewing patterns, search, Merge Duplicates and
+  the other library actions stay free, while conversions (in the viewer and
+  `qpv-cli convert`/`batch`), Thumbnail Mode, Assign Keywords and keyword
+  editing need a license key; `qpv-cli info` stays free;
+- a license key is tied to the customer's name or email and never expires.
+  It is entered with **Help → Enter License Key…** or
+  `qpv-cli license install "<name or email>" <key>`.
+
+Keys are EdDSA signatures over Curve25519 (Monocypher 4.0.2, in
+`third_party/monocypher`; Monocypher's default EdDSA hashes with BLAKE2b
+rather than Ed25519's SHA-512, at the same strength). The programs hold only
+the public key, so a key cannot be forged from them. The trial is a
+convenience, not a lock: deleting `license.dat` starts it again, and an
+edited trial date ends it.
+
+### Turning it on
+
+1. Build the key generator (it does not need the public key yet) and make
+   your signing key pair once:
+
+   ```powershell
+   cmake --build build --target qpv-keygen
+   .\build\qpv-keygen.exe init C:\Keys\quilt.qpvkey --header include\qpv\license_public_key.hpp
+   ```
+
+   `quilt.qpvkey` is the private key. Keep it outside the repository and
+   back it up: anyone with it can make keys, and if it is lost, no more keys
+   can be made that the programs already sold accept. (`*.qpvkey` files are
+   ignored by git as a safety net.) The header it writes holds only the
+   public key and is safe to commit.
+
+2. Set `QPV_LICENSING` to 1 in `include/qpv/license_config.hpp`, or configure
+   with `cmake -B build -DQPV_LICENSING=ON`. The same file sets the trial
+   length (`QPV_TRIAL_DAYS`) and an optional purchase link
+   (`QPV_PURCHASE_URL`) shown in the license messages. A build with licensing
+   on and the placeholder public key stops with an error.
+
+3. Rebuild and run `installer\windows\build-installer.ps1` as usual; it
+   builds with whatever the `build` folder is configured for.
+
+### Issuing keys
+
+```powershell
+qpv-keygen issue C:\Keys\quilt.qpvkey "Jane Doe <jane@example.com>" --log C:\Keys\issued.csv
+```
+
+Send the customer both printed lines, `Licensed to:` and `License key:`. The
+name must be entered as issued, though case and spacing do not matter.
+`--log` appends each key to a CSV file for your records, and `--date` sets
+the issue date. `qpv-keygen verify <private-key> <name> <key>` checks a key a
+customer sends back; `qpv-keygen header <private-key>` prints the public key
+header again.
+
+`qpv-keygen` is never installed or included in the installer. To try a
+licensed build without replacing the committed header, point CMake at another
+one with `-DQPV_LICENSE_PUBLIC_KEY_HEADER=<path>`.
 
 ## SVG support
 

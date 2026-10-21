@@ -1,4 +1,5 @@
 #include "qpv/io.hpp"
+#include "qpv/license.hpp"
 
 #include <algorithm>
 #include <filesystem>
@@ -29,6 +30,56 @@ void usage() {
         "  qpv-cli convert <input.pat|qli|svg> <output.pat|qli>\n"
         "  qpv-cli batch <qli-to-pat|svg-to-pat|svg-to-qli> <folder>\n"
         "                [--recursive] [--overwrite]\n";
+    if constexpr (qpv::license::enabled)
+        std::cout <<
+            "  qpv-cli license                  show the license or trial\n"
+            "  qpv-cli license install <name-or-email> <key>\n"
+            "  qpv-cli license remove\n";
+}
+
+// Conversions need a license once the trial has ended; `info` stays free.
+bool licensed_for_conversion() {
+    const auto status = qpv::license::status();
+    if (status.state == qpv::license::State::Trial)
+        std::cerr << qpv::license::describe(status) << '\n';
+    if (status.unlocked()) return true;
+    std::cerr << "Converting needs a license now that the " << qpv::license::trial_length_days
+              << "-day trial has ended.\n"
+                 "Enter one with: qpv-cli license install \"<name or email>\" <key>\n";
+    if (!qpv::license::purchase_url.empty())
+        std::cerr << "Buy a license at " << qpv::license::purchase_url << '\n';
+    return false;
+}
+
+int license_command(const std::vector<fs::path>& args) {
+    if constexpr (!qpv::license::enabled) {
+        std::cout << "This build does not need a license.\n";
+        return 0;
+    }
+    const std::string action = args.size() > 2 ? path_text(args[2]) : "";
+    if (action.empty()) {
+        std::cout << qpv::license::describe(qpv::license::status()) << '\n';
+        return 0;
+    }
+    if (action == "install" && args.size() >= 5) {
+        // The key may arrive split at its spaces or line breaks.
+        std::string key;
+        for (std::size_t i = 4; i < args.size(); ++i) key += path_text(args[i]);
+        const auto error = qpv::license::install(path_text(args[3]), key);
+        if (!error.empty()) {
+            std::cerr << error << '\n';
+            return 1;
+        }
+        std::cout << qpv::license::describe(qpv::license::status()) << '\n';
+        return 0;
+    }
+    if (action == "remove" && args.size() == 3) {
+        qpv::license::uninstall();
+        std::cout << "License removed. " << qpv::license::describe(qpv::license::status()) << '\n';
+        return 0;
+    }
+    usage();
+    return 2;
 }
 
 // The command line as paths. On Windows argv is in the ANSI code page, which
@@ -47,6 +98,7 @@ std::vector<fs::path> arguments(int argc, char** argv) {
 
 int batch(const std::vector<fs::path>& args) {
     if (args.size() < 4) { usage(); return 2; }
+    if (!licensed_for_conversion()) return 3;
     const std::string operation = path_text(args[2]);
     const fs::path& folder = args[3];
     auto flag = [&args](const char* name) {
@@ -118,11 +170,13 @@ int main(int argc, char** argv) {
         }
         if (command == "convert") {
             if (args.size() != 4) { usage(); return 2; }
+            if (!licensed_for_conversion()) return 3;
             qpv::convert_file(args[2], args[3]);
             std::cout << path_text(args[2]) << " -> " << path_text(args[3]) << '\n';
             return 0;
         }
         if (command == "batch") return batch(args);
+        if (command == "license") return license_command(args);
         usage();
         return 2;
     } catch (const std::exception& e) {
