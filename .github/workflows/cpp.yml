@@ -55,7 +55,8 @@ jobs:
       - name: Install Qt
         uses: jurplel/install-qt-action@v4
         with:
-          version: '6.11.0'
+          # Not 6.11 yet: aqtinstall 3.3 cannot read its Windows repository.
+          version: '6.10.2'
           arch: ${{ matrix.qt-arch }}
           tools: ${{ matrix.qt-tools }}
           cache: true
