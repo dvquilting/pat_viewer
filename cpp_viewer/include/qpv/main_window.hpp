@@ -16,6 +16,7 @@
 #include <memory>
 #include <vector>
 
+class QAction;
 class QCheckBox;
 class QLabel;
 class QLineEdit;
@@ -60,6 +61,10 @@ private:
     QLineEdit* keyword_edit_{};
     QLineEdit* bulk_keyword_edit_{};
     QLabel* list_status_{};
+    QLabel* license_label_{};
+    QAction* view_actions_[3]{};
+    // Conversions, thumbnails and keyword editing (see qpv/license.hpp).
+    bool features_unlocked_{true};
     QStringList library_;
     // Case-folded library paths, for constant-time duplicate checks.
     QSet<QString> library_keys_;
@@ -122,6 +127,10 @@ private:
     QString itemToolTip(const QString& path) const;
     void selectAllVisible();
     void setViewMode(int mode);
+    void updateLicense();
+    // Whether `feature` may be used, offering to enter a license if not.
+    bool requireLicense(const QString& feature);
+    void showLicense();
     void invalidateThumbnails();
     void scheduleVisibleThumbnails();
     void scheduleVisibleThumbnails(QListWidget* target);

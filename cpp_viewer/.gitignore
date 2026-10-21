@@ -5,3 +5,6 @@
 /installer/output/
 # Earlier installers kept by hand; build-installer.ps1 clears output/ each run.
 /installer/archive/
+# License signing keys and issue logs (see README.md, "Licensing")
+*.qpvkey
+issued*.csv

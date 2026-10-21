@@ -1,6 +1,8 @@
 #include "qpv/main_window.hpp"
 
 #include "qpv/io.hpp"
+#include "qpv/license.hpp"
+#include "qpv/license_dialog.hpp"
 #include "qpv/pattern_canvas.hpp"
 
 #include <QActionGroup>
@@ -328,6 +330,22 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     refreshList();
     resize(1260, 800);
     setWindowTitle(tr("Innova PAT / QLI Viewer"));
+    if constexpr (license::enabled) {
+        license_label_ = new QLabel;
+        statusBar()->addPermanentWidget(license_label_);
+        updateLicense();
+        if (!features_unlocked_) QTimer::singleShot(0, this, [this] {
+            QMessageBox box(QMessageBox::Information, tr("Trial Ended"),
+                tr("The %1-day trial has ended. You can still open and view patterns; "
+                   "converting, thumbnails and keywords need a license.")
+                    .arg(license::trial_length_days),
+                QMessageBox::NoButton, this);
+            auto* enter = box.addButton(tr("Enter License Key…"), QMessageBox::AcceptRole);
+            box.addButton(tr("Continue"), QMessageBox::RejectRole);
+            box.exec();
+            if (box.clickedButton() == enter) showLicense();
+        });
+    }
 }
 
 MainWindow::~MainWindow() {
@@ -539,6 +557,7 @@ void MainWindow::buildMenus() {
     auto addView = [&](const QString& text, const QKeySequence& shortcut, int mode) {
         auto* a = action(view, text, shortcut, [this, mode] { setViewMode(mode); });
         a->setCheckable(true); group->addAction(a); a->setChecked(mode == 0);
+        view_actions_[mode] = a;
     };
     addView(tr("&List View"), QKeySequence("Ctrl+L"), 0);
     addView(tr("&Thumbnail Mode"), QKeySequence("Ctrl+P"), 1);
@@ -561,6 +580,8 @@ void MainWindow::buildMenus() {
     auto* help = menuBar()->addMenu(tr("&Help"));
     action(help, tr("&Help"), QKeySequence::HelpContents, [this] { showHelp(); });
     help->addSeparator();
+    if constexpr (license::enabled)
+        action(help, tr("Enter &License Key…"), {}, [this] { showLicense(); });
     action(help, tr("&About"), {}, [this] { showAbout(); });
 }
 
@@ -832,9 +853,36 @@ void MainWindow::selectAllVisible() {
 }
 
 void MainWindow::setViewMode(int mode) {
+    if (mode != 0 && !requireLicense(mode == 1 ? tr("Thumbnail Mode") : tr("Assign Keywords"))) {
+        if (view_actions_[view_mode_]) view_actions_[view_mode_]->setChecked(true);
+        return;
+    }
     view_mode_ = mode;
+    if (view_actions_[mode]) view_actions_[mode]->setChecked(true);
     view_stack_->setCurrentIndex(mode);
     populateView();
+}
+
+void MainWindow::updateLicense() {
+    const auto status = license::status();
+    features_unlocked_ = status.unlocked();
+    if (license_label_) license_label_->setText(QString::fromStdString(license::describe(status)));
+    keyword_edit_->setReadOnly(!features_unlocked_);
+    keyword_edit_->setPlaceholderText(features_unlocked_
+        ? tr("Enter keywords, separated by commas…") : tr("Editing keywords needs a license."));
+    if (!features_unlocked_ && view_mode_ != 0) setViewMode(0);
+}
+
+bool MainWindow::requireLicense(const QString& feature) {
+    if constexpr (!license::enabled) return true;
+    if (features_unlocked_) return true;
+    const bool unlocked = offerLicense(this, feature);
+    updateLicense();
+    return unlocked;
+}
+
+void MainWindow::showLicense() {
+    if (runLicenseDialog(this)) updateLicense();
 }
 
 void MainWindow::invalidateThumbnails() {
@@ -1269,7 +1317,7 @@ void MainWindow::mergeDuplicates() {
 }
 
 void MainWindow::saveCurrentKeywords() {
-    if (current_.isEmpty()) return;
+    if (current_.isEmpty() || !features_unlocked_) return;
     const auto normalized = normalizeKeywords(keyword_edit_->text());
     if (keyword_edit_->text() != normalized) keyword_edit_->setText(normalized);
     // editingFinished also fires whenever focus merely leaves the field.
@@ -1283,6 +1331,7 @@ void MainWindow::saveCurrentKeywords() {
 }
 
 void MainWindow::applyBulkKeywords() {
+    if (!requireLicense(tr("Assigning keywords"))) return;
     const auto add = normalizeKeywords(bulk_keyword_edit_->text());
     QList<QListWidgetItem*> selected;
     for (auto* item : keyword_grid_->selectedItems())
@@ -1323,6 +1372,7 @@ void MainWindow::showKeywordsList() {
 }
 
 void MainWindow::convertSourceDialog(const QString& sourceExt, const QString& outputExt) {
+    if (!requireLicense(tr("Converting files"))) return;
     const auto sources = QFileDialog::getOpenFileNames(this, tr("Select file(s) to convert"), {},
         sourceExt == ".svg" ? tr("SVG Files (*.svg)") : tr("QLI Files (*.qli)"));
     if (sources.isEmpty()) return;
@@ -1348,6 +1398,7 @@ void MainWindow::convertSourceDialog(const QString& sourceExt, const QString& ou
 }
 
 void MainWindow::convertFolder(bool recursive) {
+    if (!requireLicense(tr("Converting folders"))) return;
     bool ok = false;
     const auto mode = QInputDialog::getItem(this, tr("Convert Folder"), tr("Conversion:"),
         {tr("QLI → PAT"), tr("SVG → PAT"), tr("SVG → QLI")}, 0, false, &ok);
@@ -1499,7 +1550,9 @@ void MainWindow::showAbout() {
            "<p>Supports G00/G01 linear moves and G02/G03 circular arc moves. "
            "QLI files are converted to PAT format internally before display.</p>"
            "<p>Pattern files are stored in a persistent library with user-defined "
-           "keywords for easy searching.</p>").arg(QPV_VERSION));
+           "keywords for easy searching.</p>%2").arg(QString::fromLatin1(QPV_VERSION),
+        license::enabled ? "<p><b>" + QString::fromStdString(license::describe(license::status()))
+                                          .toHtmlEscaped() + "</b></p>" : QString()));
 }
 
 void MainWindow::openInitialPath(const QString& path) {
