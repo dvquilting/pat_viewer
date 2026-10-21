@@ -56,6 +56,28 @@ The GUI is built as `qpv` when Qt 6.4+ Widgets development files are
 installed. The converter `qpv-cli` and tests require only a C++20 compiler.
 To explicitly omit the GUI use `-DQPV_BUILD_GUI=OFF`.
 
+macOS builds the same way as Linux, with Qt's `lib/cmake` folder in
+`CMAKE_PREFIX_PATH`; `qpv` is built as an app bundle, `qpv.app`.
+
+### Platforms built in CI
+
+`.github/workflows/cpp.yml` builds everything, GUI included, and runs `ctest`
+on Ubuntu (GCC), macOS (Apple Clang) and Windows (Qt's MinGW) with Qt 6.10.
+On Ubuntu it also builds and tests once with licensing on, using a signing
+key made in the job.
+
+Number parsing uses `std::from_chars` where the standard library has it for
+floating point, and otherwise (Apple's libc++, for one) a fallback that also
+ignores the C locale; see `include/qpv/parse_double.hpp`.
+
+## Packaging
+
+Only Windows has an installer. A macOS `qpv.app` that runs on other Macs
+needs Qt bundled into it with `macdeployqt`, and to be sold it must also be
+codesigned with a Developer ID certificate and notarized by Apple; none of
+that is set up yet. On Linux, `cmake --install` installs `qpv` and `qpv-cli`
+against the system's Qt.
+
 ## Windows installer
 
 With Inno Setup 6 and Qt's `windeployqt` installed, build a self-contained

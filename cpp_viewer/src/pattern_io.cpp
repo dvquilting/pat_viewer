@@ -1,4 +1,5 @@
 #include "qpv/io.hpp"
+#include "qpv/parse_double.hpp"
 
 #include <algorithm>
 #include <charconv>
@@ -58,8 +59,7 @@ bool parse_number(std::string_view line, char tag, std::size_t& cursor, double& 
     const char* begin = line.data() + tag_pos + 1;
     const char* end = line.data() + line.size();
     while (begin != end && std::isspace(static_cast<unsigned char>(*begin))) ++begin;
-    if (begin != end && *begin == '+') ++begin;
-    const auto result = std::from_chars(begin, end, value);
+    const auto result = parse_double(begin, end, value);
     if (result.ec != std::errc{}) return false;
     cursor = static_cast<std::size_t>(result.ptr - line.data());
     return true;

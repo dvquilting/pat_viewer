@@ -1,0 +1,127 @@
+name: C++ viewer
+
+on:
+  push:
+    branches: [main]
+    paths: ['cpp_viewer/**', '.github/workflows/cpp.yml']
+  pull_request:
+    paths: ['cpp_viewer/**', '.github/workflows/cpp.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            qt-arch: linux_gcc_64
+          - os: macos-latest
+            qt-arch: clang_64
+          # MinGW, the compiler the Windows installer is built with.
+          - os: windows-latest
+            qt-arch: win64_mingw
+            qt-tools: tools_mingw1310
+    env:
+      QT_QPA_PLATFORM: offscreen
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: lukka/get-cmake@latest
+
+      - name: Install Qt build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgl1-mesa-dev libxkbcommon-dev libxkbcommon-x11-0 \
+            libegl1 libfontconfig1 libfreetype6 libdbus-1-3 libxcb-cursor0
+          # Lets the core tests check number parsing under a comma-decimal locale.
+          sudo locale-gen de_DE.UTF-8
+
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          # Not 6.11 yet: aqtinstall 3.3 cannot read its Windows repository.
+          version: '6.10.2'
+          arch: ${{ matrix.qt-arch }}
+          tools: ${{ matrix.qt-tools }}
+          cache: true
+
+      - name: Use Qt's MinGW
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          "$env:IQTA_TOOLS\mingw1310_64\bin" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+          "CC=gcc" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "CXX=g++" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+
+      - name: Configure
+        run: >
+          cmake -S cpp_viewer -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_PREFIX_PATH="$QT_ROOT_DIR"
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Test
+        run: |
+          if [ "$RUNNER_OS" = Windows ]; then
+            # Git's bash puts its own, incompatible MinGW runtime DLLs first.
+            PATH="$(cygpath -u "$QT_ROOT_DIR")/bin:$(cygpath -u "$IQTA_TOOLS")/mingw1310_64/bin:$PATH"
+          fi
+          # Qt is found QUIETly, so make sure the GUI and its test were built.
+          ctest --test-dir build -N | grep qpv-thumbnail-tests > /dev/null
+          ctest --test-dir build --output-on-failure --timeout 120
+
+      # A licensed build needs a real public key: make a throwaway one.
+      - name: Make a signing key
+        if: runner.os == 'Linux'
+        run: |
+          mkdir -p "$RUNNER_TEMP/keys"
+          build/qpv-keygen init "$RUNNER_TEMP/keys/ci.qpvkey" \
+            --header "$RUNNER_TEMP/keys/license_public_key.hpp"
+
+      - name: Configure and build with licensing on
+        if: runner.os == 'Linux'
+        run: |
+          cmake -S cpp_viewer -B build-licensed -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_PREFIX_PATH="$QT_ROOT_DIR" \
+            -DQPV_LICENSING=ON \
+            -DQPV_LICENSE_PUBLIC_KEY_HEADER="$RUNNER_TEMP/keys/license_public_key.hpp"
+          cmake --build build-licensed
+
+      - name: Test with licensing on
+        if: runner.os == 'Linux'
+        # The trial and license state go in a throwaway home, not the runner's.
+        env:
+          HOME: ${{ runner.temp }}/home
+          XDG_CONFIG_HOME: ${{ runner.temp }}/home/.config
+          APPDATA: ${{ runner.temp }}/home/AppData/Roaming
+        run: |
+          mkdir -p "$HOME"
+          ctest --test-dir build-licensed --output-on-failure --timeout 120
+          # A key from qpv-keygen installs; the same key for another name does not.
+          key=$(build/qpv-keygen issue "$RUNNER_TEMP/keys/ci.qpvkey" "CI Runner" |
+                sed -n 's/^License key: //p')
+          test -n "$key"
+          build-licensed/qpv-cli license install "CI Runner" "$key"
+          if build-licensed/qpv-cli license install "Someone Else" "$key"; then
+            echo "A key was accepted for the wrong name" >&2
+            exit 1
+          fi

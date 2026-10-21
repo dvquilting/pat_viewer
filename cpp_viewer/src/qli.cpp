@@ -1,4 +1,5 @@
 #include "qpv/io.hpp"
+#include "qpv/parse_double.hpp"
 
 #include <algorithm>
 #include <charconv>
@@ -34,12 +35,9 @@ double number(std::string token) {
     // Search from 1 so that a leading sign is kept.
     const auto junk = token.find_first_of("]\r\n*+<>", 1);
     if (junk != std::string::npos) token.resize(junk);
-    // std::from_chars ignores the C locale, unlike std::stod.
-    const char* begin = token.data();
-    const char* end = begin + token.size();
-    if (begin != end && *begin == '+') ++begin;
+    // parse_double ignores the C locale, unlike std::stod.
     double value{};
-    const auto result = std::from_chars(begin, end, value);
+    const auto result = parse_double(token.data(), token.data() + token.size(), value);
     return result.ec == std::errc{} && std::isfinite(value) ? value : 0.0;
 }
 
