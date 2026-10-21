@@ -19,6 +19,7 @@ jobs:
   build:
     name: ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -54,7 +55,7 @@ jobs:
       - name: Install Qt
         uses: jurplel/install-qt-action@v4
         with:
-          version: '6.8.3'
+          version: '6.11.0'
           arch: ${{ matrix.qt-arch }}
           tools: ${{ matrix.qt-tools }}
           cache: true
@@ -78,9 +79,13 @@ jobs:
 
       - name: Test
         run: |
+          if [ "$RUNNER_OS" = Windows ]; then
+            # Git's bash puts its own, incompatible MinGW runtime DLLs first.
+            PATH="$(cygpath -u "$QT_ROOT_DIR")/bin:$(cygpath -u "$IQTA_TOOLS")/mingw1310_64/bin:$PATH"
+          fi
           # Qt is found QUIETly, so make sure the GUI and its test were built.
           ctest --test-dir build -N | grep qpv-thumbnail-tests > /dev/null
-          ctest --test-dir build --output-on-failure
+          ctest --test-dir build --output-on-failure --timeout 120
 
       # A licensed build needs a real public key: make a throwaway one.
       - name: Make a signing key
@@ -109,7 +114,7 @@ jobs:
           APPDATA: ${{ runner.temp }}/home/AppData/Roaming
         run: |
           mkdir -p "$HOME"
-          ctest --test-dir build-licensed --output-on-failure
+          ctest --test-dir build-licensed --output-on-failure --timeout 120
           # A key from qpv-keygen installs; the same key for another name does not.
           key=$(build/qpv-keygen issue "$RUNNER_TEMP/keys/ci.qpvkey" "CI Runner" |
                 sed -n 's/^License key: //p')

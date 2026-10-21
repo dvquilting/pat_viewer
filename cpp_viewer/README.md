@@ -62,7 +62,7 @@ macOS builds the same way as Linux, with Qt's `lib/cmake` folder in
 ### Platforms built in CI
 
 `.github/workflows/cpp.yml` builds everything, GUI included, and runs `ctest`
-on Ubuntu (GCC), macOS (Apple Clang) and Windows (Qt's MinGW) with Qt 6.8.
+on Ubuntu (GCC), macOS (Apple Clang) and Windows (Qt's MinGW) with Qt 6.11.
 On Ubuntu it also builds and tests once with licensing on, using a signing
 key made in the job.
 
